@@ -1,3 +1,4 @@
+
 # -*- coding: utf-8 -*-
 # ============================================================
 # MLB STRIKEOUT PROP ENGINE — ONE FILE — v11.9
@@ -10292,30 +10293,17 @@ def render_moneyline_edge_tab(board, dates=None):
 BATTER_PROP_MARKETS = {
     "HITS": {
         "label": "Batter Hits",
-        # Strict MLB batter-Hits only. NHL also has a "hits" market, so do not use
-        # broad substring matching. Require the Underdog market title wording.
-        "terms": ["hits o/u", "batter hits o/u", "hits over/under", "batter hits over/under"],
-        "bad_terms": [
-            "hits allowed", "pitcher hits", "hits+runs", "hits + runs", "h+r+rbi", "hr+rbi",
-            "total bases", "singles", "doubles", "home runs", "runs o/u", "rbis", "rbi",
-            "fantasy", "shots", "goals", "assists", "saves", "blocks", "tackles", "strokes",
-            "tourney", "finishing position", "soccer", "nhl", "nba", "nfl", "golf"
-        ],
+        "terms": ["hits", "hit"],
+        "bad_terms": ["hits allowed", "pitcher hits", "hits+runs", "hits + runs", "h+r+rbi", "hr+rbi", "total bases", "fantasy"],
         "min_line": 0.5,
-        "max_line": 2.5,
+        "max_line": 3.5,
     },
     "RBI": {
         "label": "Batter RBI",
-        # Strict MLB RBI only. Prevent Total Bases/Runs/HR/Walks/SB from leaking in.
-        "terms": ["rbis o/u", "rbi o/u", "runs batted in o/u", "runs batted over/under"],
-        "bad_terms": [
-            "hits", "total bases", "singles", "doubles", "home runs", "runs o/u",
-            "batter strikeouts", "batter walks", "walks o/u", "stolen bases", "fantasy", "team rbi",
-            "shots", "goals", "assists", "saves", "blocks", "tackles", "strokes",
-            "tourney", "finishing position", "soccer", "nhl", "nba", "nfl", "golf"
-        ],
+        "terms": ["rbi", "runs batted in", "runs batted"],
+        "bad_terms": ["hits+runs", "hits + runs", "h+r+rbi", "fantasy", "team rbi"],
         "min_line": 0.5,
-        "max_line": 2.5,
+        "max_line": 4.5,
     },
 }
 
@@ -10359,26 +10347,15 @@ def _bp_text_from_obj(obj):
 
 
 def _bp_market_from_text(text):
-    """Strictly classify only MLB Batter Hits and Batter RBI Underdog rows.
-
-    This intentionally avoids broad matching because other sports also use "Hits",
-    and MLB has many neighboring batter props (Total Bases, HR, Runs, Walks, SB).
-    """
     low = str(text or "").lower()
-    # Hard reject non-target markets/sports first.
-    global_bad = [
-        "hits allowed", "pitcher hits", "total bases", "singles", "doubles", "home runs",
-        "runs o/u", "batter strikeouts", "batter walks", "walks o/u", "stolen bases",
-        "hits+runs", "hits + runs", "h+r+rbi", "fantasy", "shots", "goals", "assists",
-        "saves", "blocks", "tackles", "strokes", "tourney", "finishing position",
-        "soccer", "nhl", "nba", "nfl", "golf"
-    ]
-    if any(bad in low for bad in global_bad):
-        return None
-    if any(term in low for term in BATTER_PROP_MARKETS["RBI"]["terms"]):
-        return "RBI"
-    if any(term in low for term in BATTER_PROP_MARKETS["HITS"]["terms"]):
-        return "HITS"
+    for market, cfg in BATTER_PROP_MARKETS.items():
+        if any(bad in low for bad in cfg["bad_terms"]):
+            continue
+        if any(term in low for term in cfg["terms"]):
+            # Keep hitter props away from pitcher prop rows.
+            if "allowed" in low or "pitcher" in low and market == "HITS":
+                continue
+            return market
     return None
 
 
@@ -10401,51 +10378,20 @@ def _bp_extract_line_from_text(text, market):
 
 
 def _bp_find_line(obj, market):
-    """Extract only real Underdog prop target lines from structured fields.
-
-    Do NOT parse random numbers from the full JSON blob; that caused fake 1/2/3/4
-    lines from ids/ranks/other markets. If no structured line exists, skip row.
-    """
     if not isinstance(obj, dict):
         return None
     a = _bp_attrs(obj)
-    strict_keys = [
-        "stat_value", "line", "over_under_line", "target_value", "line_score", "overUnderLine",
-        "over_under", "display_stat_value"
-    ]
-    cfg = BATTER_PROP_MARKETS.get(market, {})
-    mn, mx = cfg.get("min_line", 0.5), cfg.get("max_line", 2.5)
     for d in [a, obj]:
         if not isinstance(d, dict):
             continue
-        for key in strict_keys:
-            raw = d.get(key)
-            v = safe_float(raw, None)
-            if v is None and isinstance(raw, str):
-                v = _bp_extract_line_from_text(raw, market)
-            if v is not None and mn <= v <= mx and abs(v * 2 - round(v * 2)) < 1e-9:
-                return float(v)
-    return None
+        for key in ["line", "stat_value", "target_value", "line_score", "over_under_line", "points", "value", "total"]:
+            v = safe_float(d.get(key), None)
+            if v is not None:
+                cfg = BATTER_PROP_MARKETS.get(market, {})
+                if cfg.get("min_line", 0.5) <= v <= cfg.get("max_line", 4.5):
+                    return float(v)
+    return _bp_extract_line_from_text(_bp_text_from_obj(obj), market)
 
-
-def _bp_clean_player_name(name):
-    """Remove Underdog market suffixes so MLB player search receives a real name."""
-    import re
-    s = str(name or "").strip()
-    # Remove common O/U prop suffixes from title/description fields.
-    patterns = [
-        r"\s+(Batter\s+)?Hits\s+O/U.*$",
-        r"\s+(Batter\s+)?Hits\s+Over/Under.*$",
-        r"\s+RBIs?\s+O/U.*$",
-        r"\s+Runs\s+Batted\s+In\s+O/U.*$",
-        r"\s+Runs\s+Batted\s+Over/Under.*$",
-    ]
-    for pat in patterns:
-        s = re.sub(pat, "", s, flags=re.I).strip()
-    # Remove punctuation fragments that sometimes trail descriptions.
-    s = re.sub(r"\s+[OU]nder.*$", "", s, flags=re.I).strip()
-    s = re.sub(r"\s+[OH]igher.*$", "", s, flags=re.I).strip()
-    return s.strip(" -|•:")
 
 def _bp_candidate_name(obj):
     if not isinstance(obj, dict):
@@ -10465,7 +10411,7 @@ def _bp_candidate_name(obj):
     if candidates:
         # Prefer the string that looks most like a real name.
         candidates = sorted(candidates, key=lambda s: (len(s.split()) >= 2, len(s)), reverse=True)
-        return _bp_clean_player_name(candidates[0])
+        return candidates[0]
     return ""
 
 
@@ -10476,228 +10422,34 @@ def _bp_active_ok(obj):
 
 @st.cache_data(ttl=120, show_spinner=False)
 def fetch_underdog_batter_prop_rows():
-    """Return only Underdog MLB batter Hits/RBI rows. Never creates synthetic lines.
-
-    Fix notes:
-    - Uses Underdog relationships first: line -> over_under -> appearance -> player.
-    - This is required because many line objects do NOT contain the player name and market
-      in the same JSON object, so broad recursive text parsing can either miss everything
-      or leak wrong sports/markets.
-    - If relationship parsing fails, a conservative direct-object fallback is used.
-    - Every displayed row must resolve to an MLB player id before it can appear.
-    """
-    def attrs(obj):
-        if not isinstance(obj, dict):
-            return {}
-        out = {}
-        a = obj.get("attributes")
-        if isinstance(a, dict):
-            out.update(a)
-        for k, v in obj.items():
-            if k not in ["attributes", "relationships", "included", "data"] and k not in out:
-                out[k] = v
-        return out
-
-    def obj_type(obj, fallback=""):
-        return str(obj.get("type") or fallback or "").lower().replace("-", "_") if isinstance(obj, dict) else ""
-
-    def obj_id(obj):
-        if not isinstance(obj, dict):
-            return None
-        v = obj.get("id") or attrs(obj).get("id")
-        return str(v) if v not in [None, ""] else None
-
-    def rel_id(obj, names):
-        if not isinstance(obj, dict):
-            return None
-        rels = obj.get("relationships") or {}
-        for name in names:
-            for key in [name, name.replace("_", "-"), name.replace("_", "")]:
-                node = rels.get(key)
-                if node is None:
-                    continue
-                data = node.get("data") if isinstance(node, dict) else node
-                if isinstance(data, dict) and data.get("id") not in [None, ""]:
-                    return str(data.get("id"))
-                if isinstance(data, list):
-                    for item in data:
-                        if isinstance(item, dict) and item.get("id") not in [None, ""]:
-                            return str(item.get("id"))
-        return None
-
-    def collect(data):
-        objs = []
-        def walk(x, parent_key=""):
-            if isinstance(x, dict):
-                y = dict(x)
-                if parent_key and "_parent_key" not in y:
-                    y["_parent_key"] = parent_key
-                objs.append(y)
-                for k, v in x.items():
-                    if isinstance(v, (dict, list)):
-                        walk(v, k)
-            elif isinstance(x, list):
-                for item in x:
-                    walk(item, parent_key)
-        walk(data)
-        return objs
-
-    def text_from(*objs):
-        parts = []
-        wanted = [
-            "title", "display_title", "name", "player_name", "full_name", "first_name", "last_name",
-            "display_name", "stat", "stat_type", "appearance_stat", "display_stat", "label", "market",
-            "market_name", "sport", "league", "sport_name", "league_name", "position", "description",
-            "over_under", "over_under_title", "scoring_type", "projection_type", "stat_value", "line_score"
-        ]
-        for obj in objs:
-            if not isinstance(obj, dict):
-                continue
-            a = attrs(obj)
-            for k in wanted:
-                v = a.get(k)
-                if isinstance(v, dict):
-                    for kk in wanted:
-                        if v.get(kk) not in [None, ""]:
-                            parts.append(str(v.get(kk)))
-                elif v not in [None, ""]:
-                    parts.append(str(v))
-        return " | ".join(parts)
-
-    def player_from(player_obj, appearance_obj=None, ou_obj=None, line_obj=None):
-        candidates = []
-        for obj in [player_obj, appearance_obj, ou_obj, line_obj]:
-            a = attrs(obj) if isinstance(obj, dict) else {}
-            first_last = (str(a.get("first_name", "")).strip() + " " + str(a.get("last_name", "")).strip()).strip()
-            candidates.extend([
-                a.get("display_name"), a.get("full_name"), a.get("name"), a.get("player_name"),
-                a.get("title"), a.get("description"), first_last
-            ])
-        cleaned = []
-        for c in candidates:
-            if isinstance(c, str) and 2 <= len(c) <= 80:
-                cc = _bp_clean_player_name(c)
-                if cc and len(normalize_name(cc).split()) >= 2:
-                    cleaned.append(cc)
-        # Prefer explicit player object names first, then shortest cleaned title-like candidate.
-        if cleaned:
-            cleaned = sorted(cleaned, key=lambda x: (" o/u" in x.lower(), len(x)))
-            return cleaned[0]
-        return ""
-
-    def classify_market(*objs):
-        blob = text_from(*objs).lower()
-        # Hard reject neighboring markets and wrong sports. Do not reject the word "rbi"
-        # globally because that is the target for the RBI tab.
-        non_targets = [
-            "hits allowed", "pitcher hits", "total bases", "singles", "doubles", "home runs",
-            "batter strikeouts", "batter walks", "walks o/u", "stolen bases", "h+r+rbi", "hits+runs",
-            "hits + runs", "fantasy", "shots", "goals", "assists", "saves", "blocks", "tackles",
-            "strokes", "tourney", "finishing position", "soccer", "nhl", "nba", "nfl", "golf"
-        ]
-        if any(x in blob for x in non_targets):
-            return None
-        # Prefer structured stat fields if available.
-        stat_blob = " ".join(
-            str(attrs(o).get(k, "")) for o in objs if isinstance(o, dict)
-            for k in ["stat", "stat_type", "appearance_stat", "display_stat", "market_name", "title", "display_title"]
-        ).lower()
-        if any(x in stat_blob for x in ["runs batted in", "rbis", "rbi"]):
-            return "RBI"
-        # Hits must be plain batter hits; player/title text often says just "Hits" without O/U.
-        if any(x in stat_blob for x in ["batter hits", " hits", "hits"]):
-            return "HITS"
-        return _bp_market_from_text(blob)
-
-    def line_from(*objs, market=None):
-        # Only use structured line fields. This prevents ids/ranks/player numbers becoming fake lines.
-        keys = ["stat_value", "line_score", "over_under_line", "target_value", "display_stat_value"]
-        cfg = BATTER_PROP_MARKETS.get(market or "", {})
-        mn = cfg.get("min_line", 0.5)
-        mx = cfg.get("max_line", 2.5)
-        for obj in objs:
-            a = attrs(obj) if isinstance(obj, dict) else {}
-            for k in keys:
-                raw = a.get(k)
-                v = safe_float(raw, None)
-                if v is None and isinstance(raw, str):
-                    v = _bp_extract_line_from_text(raw, market)
-                if v is not None and mn <= v <= mx and abs(v * 2 - round(v * 2)) < 1e-9:
-                    return float(v)
-        return None
-
-    def active_ok(*objs):
-        status_blob = " ".join(
-            str(attrs(o).get(k, "")) for o in objs if isinstance(o, dict)
-            for k in ["status", "state", "display_status", "over_status", "under_status", "hidden", "active"]
-        ).lower()
-        return not any(x in status_blob for x in ["suspended", "removed", "hidden true", "inactive", "closed", "disabled"])
-
+    """Return only Underdog batter Hits/RBI rows. Never creates synthetic lines."""
     rows = []
     for url in UNDERDOG_URLS:
         data = safe_get_json(url, timeout=18)
         if not data:
             continue
-        objects = collect(data)
-        by_id = {}
-        line_candidates = []
+        objects = _bp_collect_objects(data)
         for obj in objects:
-            oid = obj_id(obj)
-            if oid:
-                by_id[oid] = obj
-            typ = obj_type(obj, obj.get("_parent_key", ""))
-            a = attrs(obj)
-            if typ in {"over_under_line", "over_under_lines"} or "over_under_line" in typ or any(a.get(k) not in [None, ""] for k in ["stat_value", "line_score", "over_under_line", "target_value"]):
-                line_candidates.append(obj)
-
-        def get(oid):
-            return by_id.get(str(oid)) if oid not in [None, ""] else None
-
-        # Relationship parser: line -> over_under -> appearance -> player.
-        for line_obj in line_candidates:
-            ou_obj = get(rel_id(line_obj, ["over_under", "over_unders"]))
-            app_obj = get(rel_id(ou_obj, ["appearance", "appearances"])) or get(rel_id(line_obj, ["appearance", "appearances"]))
-            player_obj = get(rel_id(app_obj, ["player", "players"])) or get(rel_id(ou_obj, ["player", "players"])) or get(rel_id(line_obj, ["player", "players"]))
-            market = classify_market(line_obj, ou_obj, app_obj, player_obj)
+            if not isinstance(obj, dict):
+                continue
+            blob = _bp_text_from_obj(obj)
+            low = blob.lower()
+            if is_bad_sport_text(low):
+                continue
+            market = _bp_market_from_text(blob)
             if not market:
                 continue
-            if not active_ok(line_obj, ou_obj, app_obj, player_obj):
+            if not _bp_active_ok(obj):
                 continue
-            line = line_from(line_obj, ou_obj, app_obj, market=market)
-            if line is None:
-                continue
-            player = player_from(player_obj, app_obj, ou_obj, line_obj)
-            if not player or len(normalize_name(player).split()) < 2:
-                continue
-            if any(x in normalize_name(player) for x in ["team", "first inning", "game"]):
-                continue
-            pid = _mlb_search_player_id_by_name(player)
-            if not pid:
-                continue
-            rows.append({
-                "Source": "Underdog",
-                "Player": player.strip(),
-                "Market": market,
-                "Market Label": BATTER_PROP_MARKETS[market]["label"],
-                "Line": float(line),
-                "Evidence": text_from(line_obj, ou_obj, app_obj, player_obj)[:240],
-            })
-
-        # Conservative direct-object fallback for API shapes where relationship objects are flattened.
-        # Still requires structured line + MLB-resolvable player, so it will not create fake lines.
-        for obj in objects:
-            blob = _bp_text_from_obj(obj)
-            market = classify_market(obj)
-            if not market or not active_ok(obj):
-                continue
-            line = line_from(obj, market=market)
+            line = _bp_find_line(obj, market)
             if line is None:
                 continue
             player = _bp_candidate_name(obj)
-            player = _bp_clean_player_name(player)
             if not player or len(normalize_name(player).split()) < 2:
+                # Some Underdog objects need relationship joining; avoid guessing names.
                 continue
-            if not _mlb_search_player_id_by_name(player):
+            # Prevent pitcher rows from leaking into batter tabs.
+            if any(x in normalize_name(player) for x in ["team", "first inning", "game"]):
                 continue
             rows.append({
                 "Source": "Underdog",
@@ -10707,69 +10459,10 @@ def fetch_underdog_batter_prop_rows():
                 "Line": float(line),
                 "Evidence": blob[:240],
             })
-
-
-
-    # Last-resort Underdog fallback:
-    # Some Underdog payloads do not link line -> market -> appearance in the expected JSON:API
-    # relationship shape. If the strict relationship parser finds nothing, scan flattened objects
-    # for explicit MLB-style titles like "Pete Alonso Hits O/U" or "Pete Alonso RBIs O/U".
-    # This still refuses fake rows by requiring:
-    #   1) exact target market wording, not neighboring props;
-    #   2) a structured/nearby line in a sane range;
-    #   3) MLB player-name validation.
-    if not rows:
-        import re
-        fallback_rows = []
-        target_re = re.compile(r"([A-Z][A-Za-zÀ-ÿ.'’\-]+(?:\s+(?:[A-Z][A-Za-zÀ-ÿ.'’\-]+|Jr\.|Sr\.|II|III|IV)){1,4})\s+(Hits|RBIs?)\s+O/U", re.I)
-        bad_market_re = re.compile(r"Total Bases|Home Runs|Runs O/U|Batter Strikeouts|Batter Walks|Walks O/U|Stolen Bases|Singles|Doubles|Fantasy|Shots|Goals|Assists|Saves|Blocks|Tackles|Strokes|Tourney|Finishing Position", re.I)
-        for url in UNDERDOG_URLS:
-            data = safe_get_json(url, timeout=18)
-            if not data:
-                continue
-            objects = collect(data)
-            for obj in objects:
-                blob = _bp_text_from_obj(obj)
-                if not blob or bad_market_re.search(blob):
-                    continue
-                # Avoid obvious non-MLB sports payloads when the object exposes a sport/league label.
-                sport_blob = " ".join(str(attrs(obj).get(k, "")) for k in ["sport", "sport_name", "league", "league_name"]).lower()
-                if any(x in sport_blob for x in ["nhl", "nba", "nfl", "soccer", "golf", "tennis", "hockey", "basketball", "football"]):
-                    continue
-                m = target_re.search(blob)
-                if not m:
-                    continue
-                player = _bp_clean_player_name(m.group(1))
-                stat = m.group(2).lower()
-                market = "RBI" if stat.startswith("rbi") else "HITS"
-                # structured first; fallback to the target title area only, not entire nested JSON ids
-                line = _bp_find_line(obj, market)
-                if line is None:
-                    # Look near the title match for explicit stat/line phrasing.
-                    start = max(0, m.start() - 160)
-                    end = min(len(blob), m.end() + 240)
-                    line = _bp_extract_line_from_text(blob[start:end], market)
-                if line is None:
-                    continue
-                if not player or len(normalize_name(player).split()) < 2:
-                    continue
-                pid = _mlb_search_player_id_by_name(player)
-                if not pid:
-                    continue
-                fallback_rows.append({
-                    "Source": "Underdog",
-                    "Player": player.strip(),
-                    "Market": market,
-                    "Market Label": BATTER_PROP_MARKETS[market]["label"],
-                    "Line": float(line),
-                    "Evidence": "fallback title scan: " + blob[:220],
-                })
-        rows.extend(fallback_rows)
-
-    # Deduplicate by player/market. Keep the first real line for each player/market.
+    # Deduplicate by player/market/line.
     dedup = {}
     for r in rows:
-        key = (normalize_name(r.get("Player")), r.get("Market"))
+        key = (normalize_name(r.get("Player")), r.get("Market"), float(r.get("Line")))
         if key not in dedup:
             dedup[key] = r
     return list(dedup.values())
@@ -10782,112 +10475,6 @@ def _moneyball_score_from_components(components):
     if not vals:
         return 50
     return int(round(clamp(sum(v * w for v, w in vals) / sum(w for _, w in vals), 0, 100)))
-
-
-@st.cache_data(ttl=21600, show_spinner=False)
-def _batter_basic_obp_by_id(player_id):
-    """Small helper for RBI context: OBP for hitters projected ahead in lineup."""
-    if not player_id:
-        return None
-    try:
-        season = safe_get_json(f"{MLB_BASE}/people/{player_id}/stats", params={"stats": "season", "group": "hitting"}, timeout=10) or {}
-        split = get_first_stat_split(season)
-        stat = (split or {}).get("stat", {})
-        h = safe_float(stat.get("hits"), 0) or 0
-        ab = safe_float(stat.get("atBats"), 0) or 0
-        bb = safe_float(stat.get("baseOnBalls"), 0) or 0
-        hbp = safe_float(stat.get("hitByPitch"), 0) or 0
-        sf = safe_float(stat.get("sacFlies"), 0) or 0
-        denom = ab + bb + hbp + sf
-        return (h + bb + hbp) / denom if denom > 0 else None
-    except Exception:
-        return None
-
-
-def _lineup_slot_score(slot):
-    """Batter props only: more PA for hits, better RBI chances in heart of order."""
-    try:
-        slot = int(round(float(slot)))
-    except Exception:
-        return 50
-    mapping = {1: 88, 2: 84, 3: 82, 4: 78, 5: 70, 6: 58, 7: 48, 8: 42, 9: 38}
-    return mapping.get(slot, 50)
-
-
-def _rbi_slot_score(slot):
-    try:
-        slot = int(round(float(slot)))
-    except Exception:
-        return 50
-    mapping = {1: 48, 2: 62, 3: 86, 4: 92, 5: 84, 6: 66, 7: 50, 8: 42, 9: 38}
-    return mapping.get(slot, 50)
-
-
-@st.cache_data(ttl=900, show_spinner=False)
-def get_batter_lineup_context(team_id, player_name):
-    """Projected lineup context for Batter Hits/RBI tabs only.
-
-    Uses the stable MLB projected/pre-lineup engine already in the app.
-    It does not alter K projections or Underdog line selection.
-    """
-    out = {
-        "lineup_slot": None,
-        "lineup_slot_score": 50,
-        "rbi_slot_score": 50,
-        "obp_ahead": None,
-        "obp_ahead_score": 50,
-        "batters_ahead_count": 0,
-        "lineup_source": "NO_LINEUP_CONTEXT",
-    }
-    if not team_id or not player_name:
-        return out
-    try:
-        rows = build_mlb_projected_lineup_rows(team_id, pitcher_hand=None, before_date=None) or []
-        if not rows:
-            return out
-        target_norm = normalize_name(player_name)
-        match = None
-        for r in rows:
-            if normalize_name(r.get("Batter")) == target_norm:
-                match = r
-                break
-        if not match:
-            # Fuzzy fallback for suffixes/accents/middle initials.
-            for r in rows:
-                rn = normalize_name(r.get("Batter"))
-                if target_norm in rn or rn in target_norm:
-                    match = r
-                    break
-        if not match:
-            out["lineup_source"] = "PROJECTED_LINEUP_PLAYER_NOT_FOUND"
-            return out
-        slot = safe_float(match.get("Order") or match.get("Projected Order"), None)
-        ahead = []
-        if slot is not None:
-            for r in rows:
-                o = safe_float(r.get("Order") or r.get("Projected Order"), None)
-                if o is not None and o < slot:
-                    ahead.append(r)
-        obps = []
-        for r in ahead[-3:]:  # immediate hitters ahead matter most for RBI chances
-            oid = r.get("Player ID")
-            obp = _batter_basic_obp_by_id(oid)
-            if obp is not None:
-                obps.append(obp)
-        obp_ahead = float(np.mean(obps)) if obps else None
-        obp_score = None if obp_ahead is None else clamp((obp_ahead - 0.285) / 0.095 * 100, 0, 100)
-        out.update({
-            "lineup_slot": None if slot is None else int(round(float(slot))),
-            "lineup_slot_score": _lineup_slot_score(slot),
-            "rbi_slot_score": _rbi_slot_score(slot),
-            "obp_ahead": obp_ahead,
-            "obp_ahead_score": 50 if obp_score is None else int(round(obp_score)),
-            "batters_ahead_count": len(ahead),
-            "lineup_source": match.get("Lineup Source") or "MLB_PROJECTED_CONTEXT",
-        })
-    except Exception:
-        pass
-    return out
 
 
 @st.cache_data(ttl=21600, show_spinner=False)
@@ -10924,16 +10511,6 @@ def get_batter_hits_rbi_profile_by_name(player_name):
         "team_run_env_score": None,
         "team_baseruns_pg": None,
         "team_obp": None,
-        "lineup_slot": None,
-        "lineup_slot_score": 50,
-        "rbi_slot_score": 50,
-        "obp_ahead": None,
-        "obp_ahead_score": 50,
-        "batters_ahead_count": 0,
-        "lineup_source": "NO_LINEUP_CONTEXT",
-        "pitcher_hit_allow_score": 50,
-        "bullpen_hit_score": 50,
-        "risp_score": 50,
         "note": "No MLB player id" if not pid else "MLB Moneyball profile loaded",
     }
     if not pid:
@@ -11006,21 +10583,6 @@ def get_batter_hits_rbi_profile_by_name(player_name):
                 "team_baseruns_pg": team_env.get("baseruns_pg") if team_env else None,
                 "team_obp": team_env.get("obp") if team_env else None,
             })
-            # Hits/RBI context only: projected lineup slot and OBP of hitters ahead.
-            try:
-                lu_ctx = get_batter_lineup_context(team_id, player_name) if team_id else {}
-                out.update({k: v for k, v in (lu_ctx or {}).items() if k in out})
-            except Exception:
-                pass
-            # Conservative contextual placeholders from available team/run environment.
-            # These are neutral when opponent starter/bullpen matchup is not available in UD row.
-            try:
-                risp_proxy = clamp(50 + ((rbi / max(gp, 1)) - 0.45) * 35 + ((ops or 0.700) - 0.700) * 40, 25, 85) if gp and gp > 0 else 50
-                out["risp_score"] = int(round(risp_proxy))
-                out["pitcher_hit_allow_score"] = 50
-                out["bullpen_hit_score"] = 50
-            except Exception:
-                pass
         except Exception:
             pass
     except Exception as e:
@@ -11064,70 +10626,38 @@ def project_batter_prop(row):
     rbi_score = safe_float(prof.get("rbi_opportunity_score"), 50) or 50
     team_run_score = safe_float(prof.get("team_run_env_score"), 50) or 50
     team_bsr = safe_float(prof.get("team_baseruns_pg"), None)
-    lineup_slot = safe_float(prof.get("lineup_slot"), None)
-    lineup_slot_score = safe_float(prof.get("lineup_slot_score"), 50) or 50
-    rbi_slot_score = safe_float(prof.get("rbi_slot_score"), 50) or 50
-    obp_ahead = safe_float(prof.get("obp_ahead"), None)
-    obp_ahead_score = safe_float(prof.get("obp_ahead_score"), 50) or 50
-    pitcher_hit_score = safe_float(prof.get("pitcher_hit_allow_score"), 50) or 50
-    bullpen_hit_score = safe_float(prof.get("bullpen_hit_score"), 50) or 50
-    risp_score = safe_float(prof.get("risp_score"), 50) or 50
 
     if market == "HITS":
         season = safe_float(prof.get("season_hits_per_game"), None)
         recent = safe_float(prof.get("recent_hits_avg"), None)
-        # League-average fallbacks keep true MLB hitters from showing Projection=None.
-        # They are conservative and still PASS unless there is a real edge.
-        obp = safe_float(obp, 0.315)
-        contact = safe_float(contact, 0.765)
-        babip = safe_float(babip, 0.300)
-        season = safe_float(season, max(0.55, obp * 2.65))
         # OBP and contact are Moneyball-style support signals, not the line source.
-        obp_proxy = obp * 3.00
-        contact_proxy = contact * 1.30
-        babip_proxy = babip * 2.70
+        obp_proxy = None if obp is None else obp * 3.25
+        contact_proxy = None if contact is None else contact * 1.45
+        babip_proxy = None if babip is None else babip * 3.10
         vals, weights = [], []
-        run_env_proxy = max(0.15, min(1.65, (team_bsr if team_bsr is not None else MLB_AVG_RUNS_PER_GAME) / max(MLB_AVG_RUNS_PER_GAME, 0.1) * 0.85))
-        lineup_pa_mult = 1.0 + ((lineup_slot_score - 50) / 100.0) * 0.16
-        pitcher_hit_mult = 1.0 + ((pitcher_hit_score - 50) / 100.0) * 0.08
-        bullpen_hit_mult = 1.0 + ((bullpen_hit_score - 50) / 100.0) * 0.05
-        for v, w in [(season, 0.38), (recent, 0.17), (obp_proxy, 0.13), (contact_proxy, 0.10), (babip_proxy, 0.07), (run_env_proxy, 0.04)]:
+        run_env_proxy = None if team_bsr is None else max(0.15, min(1.65, team_bsr / max(MLB_AVG_RUNS_PER_GAME, 0.1) * 0.95))
+        for v, w in [(season, 0.40), (recent, 0.24), (obp_proxy, 0.14), (contact_proxy, 0.11), (babip_proxy, 0.07), (run_env_proxy, 0.04)]:
             if v is not None:
                 vals.append(v * w); weights.append(w)
         proj = sum(vals) / sum(weights) if weights else None
-        if proj is not None:
-            proj = float(proj) * lineup_pa_mult * pitcher_hit_mult * bullpen_hit_mult
         hit_rate = prof.get("recent_hit_rate_05")
-        model_score = _moneyball_score_from_components([
-            (hits_score, 0.44), (lineup_slot_score, 0.18), (pitcher_hit_score, 0.12),
-            (bullpen_hit_score, 0.08), (team_run_score, 0.08), (50 + (safe_float(prof.get("recent_hit_rate_05"), 0.5) - 0.5) * 70, 0.10)
-        ])
-        value_label = "HITS_MONEYBALL_PLUS"
+        model_score = hits_score
+        value_label = "HITS_MONEYBALL"
     else:
         season = safe_float(prof.get("season_rbi_per_game"), None)
         recent = safe_float(prof.get("recent_rbi_avg"), None)
         # RBI is opportunity-driven: recent RBI + season RBI + OBP/power/contact proxies.
         obp_proxy = None if obp is None else max(0.08, (obp - 0.245) * 2.15)
         contact_proxy = None if contact is None else max(0.04, (contact - 0.62) * 0.95)
-        run_env_proxy = max(0.08, ((rbi_score * 0.42 + team_run_score * 0.28 + obp_ahead_score * 0.18 + rbi_slot_score * 0.12) / 100.0) * 0.86)
-        rbi_slot_mult = 1.0 + ((rbi_slot_score - 50) / 100.0) * 0.28
-        obp_ahead_mult = 1.0 + ((obp_ahead_score - 50) / 100.0) * 0.18
-        risp_mult = 1.0 + ((risp_score - 50) / 100.0) * 0.10
-        pitcher_runner_mult = 1.0 + ((pitcher_hit_score - 50) / 100.0) * 0.08
-        bullpen_run_mult = 1.0 + ((bullpen_hit_score - 50) / 100.0) * 0.06
+        run_env_proxy = max(0.08, ((rbi_score * 0.60 + team_run_score * 0.40) / 100.0) * 0.78)
         vals, weights = [], []
-        for v, w in [(season, 0.31), (recent, 0.20), (run_env_proxy, 0.22), (obp_proxy, 0.07), (contact_proxy, 0.04)]:
+        for v, w in [(season, 0.40), (recent, 0.25), (run_env_proxy, 0.22), (obp_proxy, 0.08), (contact_proxy, 0.05)]:
             if v is not None:
                 vals.append(v * w); weights.append(w)
         proj = sum(vals) / sum(weights) if weights else None
-        if proj is not None:
-            proj = float(proj) * rbi_slot_mult * obp_ahead_mult * risp_mult * pitcher_runner_mult * bullpen_run_mult
         hit_rate = prof.get("recent_rbi_rate_05")
-        model_score = _moneyball_score_from_components([
-            (rbi_score, 0.30), (rbi_slot_score, 0.22), (obp_ahead_score, 0.20),
-            (team_run_score, 0.13), (risp_score, 0.10), (bullpen_hit_score, 0.05)
-        ])
-        value_label = "RBI_OPPORTUNITY_PLUS"
+        model_score = rbi_score
+        value_label = "RBI_OPPORTUNITY"
 
     if proj is None or line is None:
         side, conf, edge = "PASS", None, None
@@ -11158,302 +10688,11 @@ def project_batter_prop(row):
         "RBI Opp Score": None if rbi_score is None else int(rbi_score),
         "Team Run Env": None if team_run_score is None else int(team_run_score),
         "Team BaseRuns/G": None if team_bsr is None else round(float(team_bsr), 2),
-        "Lineup Slot": None if lineup_slot is None else int(lineup_slot),
-        "Lineup Slot Score": int(lineup_slot_score),
-        "OBP Ahead": None if obp_ahead is None else round(float(obp_ahead), 3),
-        "OBP Ahead Score": int(obp_ahead_score),
-        "Pitcher Hit Score": int(pitcher_hit_score),
-        "Bullpen Hit Score": int(bullpen_hit_score),
-        "RISP Score": int(risp_score),
         "Model Label": value_label,
-        "Attribution": (
-            f"OBP/contact {round(float(hits_score),0)} | Slot {int(lineup_slot_score)} | Pitcher H {int(pitcher_hit_score)} | Bullpen {int(bullpen_hit_score)} | RunEnv {int(team_run_score)}"
-            if market == "HITS" else
-            f"OBP ahead {int(obp_ahead_score)} | RBI slot {int(rbi_slot_score)} | Team runs {int(team_run_score)} | RISP {int(risp_score)} | Bullpen {int(bullpen_hit_score)}"
-        ),
         "Recent Avg": None if (market == "HITS" and prof.get("recent_hits_avg") is None) or (market == "RBI" and prof.get("recent_rbi_avg") is None) else round(float(prof.get("recent_hits_avg") if market == "HITS" else prof.get("recent_rbi_avg")), 2),
         "Recent Hit Rate %": None if hit_rate is None else round(float(hit_rate) * 100, 1),
         "Profile Note": prof.get("note"),
     }
-
-
-# =========================
-# BATTER PROP LOADER 2.2 — RELATIONSHIP-TYPE SAFE + EXACT TITLE FALLBACK
-# =========================
-# Overrides the earlier loader. Fixes the Underdog JSON:API relationship issue where
-# ids can collide across object types. Uses (type,id) maps, then exact-title fallback.
-# Still uses Underdog only and never creates synthetic lines.
-@st.cache_data(ttl=120, show_spinner=False)
-def fetch_underdog_batter_prop_rows():
-    import re
-
-    def attrs(obj):
-        if not isinstance(obj, dict):
-            return {}
-        out = {}
-        a = obj.get("attributes")
-        if isinstance(a, dict):
-            out.update(a)
-        for k, v in obj.items():
-            if k not in ["attributes", "relationships", "included", "data"] and k not in out:
-                out[k] = v
-        return out
-
-    def typ(obj, fallback=""):
-        return str((obj or {}).get("type") or fallback or "").lower().replace("-", "_") if isinstance(obj, dict) else ""
-
-    def oid(obj):
-        if not isinstance(obj, dict):
-            return None
-        v = obj.get("id") or attrs(obj).get("id")
-        return str(v) if v not in [None, ""] else None
-
-    def collect(data):
-        objs = []
-        def walk(x, parent_key=""):
-            if isinstance(x, dict):
-                y = dict(x)
-                if parent_key and "_parent_key" not in y:
-                    y["_parent_key"] = parent_key
-                # Keep only meaningful object-like dicts to reduce false matches.
-                if any(k in y for k in ["type", "attributes", "relationships", "id"]):
-                    objs.append(y)
-                for k, v in x.items():
-                    if isinstance(v, (dict, list)):
-                        walk(v, k)
-            elif isinstance(x, list):
-                for item in x:
-                    walk(item, parent_key)
-        walk(data)
-        return objs
-
-    def build_maps(objects):
-        by_key = {}
-        by_id = {}
-        for o in objects:
-            i = oid(o)
-            if not i:
-                continue
-            t = typ(o, o.get("_parent_key", ""))
-            if t:
-                by_key[(t, i)] = o
-                # also singular/plural aliases
-                by_key[(t.rstrip('s'), i)] = o
-                by_key[(t + 's', i)] = o
-            by_id.setdefault(i, []).append(o)
-        return by_key, by_id
-
-    def rel_obj(obj, names, by_key, by_id):
-        if not isinstance(obj, dict):
-            return None
-        rels = obj.get("relationships") or {}
-        for name in names:
-            keys = {name, name.replace("_", "-"), name.replace("_", ""), name.rstrip('s'), name + 's'}
-            for key in keys:
-                node = rels.get(key)
-                if node is None:
-                    continue
-                data = node.get("data") if isinstance(node, dict) else node
-                items = data if isinstance(data, list) else [data]
-                for item in items:
-                    if not isinstance(item, dict):
-                        continue
-                    ri = item.get("id")
-                    rt = str(item.get("type") or key or "").lower().replace("-", "_")
-                    if ri in [None, ""]:
-                        continue
-                    # Type-aware lookup first. This fixes id collisions.
-                    for cand_t in [rt, rt.rstrip('s'), rt + 's', key, key.rstrip('s'), key + 's']:
-                        hit = by_key.get((cand_t, str(ri)))
-                        if hit is not None:
-                            return hit
-                    # Last resort by id only; prefer object whose type resembles the relationship key.
-                    candidates = by_id.get(str(ri), [])
-                    if candidates:
-                        for c in candidates:
-                            ct = typ(c, c.get("_parent_key", ""))
-                            if key.rstrip('s') in ct or ct.rstrip('s') in key:
-                                return c
-                        return candidates[0]
-        return None
-
-    def text_from(*objs):
-        parts = []
-        wanted = [
-            "title", "display_title", "name", "player_name", "full_name", "first_name", "last_name",
-            "display_name", "stat", "stat_type", "appearance_stat", "display_stat", "label", "market",
-            "market_name", "sport", "league", "sport_name", "league_name", "description",
-            "over_under", "over_under_title", "scoring_type", "projection_type", "stat_value", "line_score",
-            "appearance_name", "position"
-        ]
-        for obj in objs:
-            if not isinstance(obj, dict):
-                continue
-            a = attrs(obj)
-            for d in [a, obj]:
-                if not isinstance(d, dict):
-                    continue
-                for k in wanted:
-                    v = d.get(k)
-                    if isinstance(v, dict):
-                        for kk in wanted:
-                            if v.get(kk) not in [None, ""]:
-                                parts.append(str(v.get(kk)))
-                    elif v not in [None, ""] and not isinstance(v, (dict, list)):
-                        parts.append(str(v))
-        return " | ".join(parts)
-
-    bad_re = re.compile(r"Total Bases|Home Runs|Runs O/U|Batter Strikeouts|Batter Walks|Walks O/U|Stolen Bases|Singles|Doubles|Fantasy|Shots|Goals|Assists|Saves|Blocks|Tackles|Strokes|Tourney|Finishing Position|Soccer|NHL|NBA|NFL|Golf|Hockey|Basketball|Football", re.I)
-    hits_re = re.compile(r"\b(Batter\s+)?Hits\s+O/U\b|\bHits\s+Over/Under\b", re.I)
-    rbi_re = re.compile(r"\bRBIs?\s+O/U\b|\bRuns\s+Batted\s+In\s+O/U\b|\bRuns\s+Batted\s+In\s+Over/Under\b", re.I)
-    title_re = re.compile(r"([A-Z][A-Za-zÀ-ÿ.'’\-]+(?:\s+(?:[A-Z][A-Za-zÀ-ÿ.'’\-]+|Jr\.|Sr\.|II|III|IV)){1,5})\s+(Hits|RBIs?)\s+O/U", re.I)
-
-    def classify(*objs):
-        blob = text_from(*objs)
-        if bad_re.search(blob or ""):
-            return None
-        # Structured/title fields get priority over the huge JSON blob.
-        key_text = " | ".join(str(attrs(o).get(k, "")) for o in objs if isinstance(o, dict) for k in ["title","display_title","stat","stat_type","appearance_stat","display_stat","market_name","name"])
-        if bad_re.search(key_text or ""):
-            return None
-        if rbi_re.search(key_text) or re.search(r"\bRBIs?\b|Runs Batted In", key_text, re.I):
-            return "RBI"
-        if hits_re.search(key_text) or re.search(r"\bHits\b", key_text, re.I):
-            return "HITS"
-        m = title_re.search(blob or "")
-        if m:
-            return "RBI" if m.group(2).lower().startswith("rbi") else "HITS"
-        return None
-
-    def line_from(*objs, market=None):
-        # Accept only structured line fields first. Underdog often stores pick'em lines as 1/2/3/4.
-        keys = ["stat_value", "line", "over_under_line", "target_value", "line_score", "overUnderLine", "display_stat_value"]
-        mn, mx = 0.0, 4.5
-        for obj in objs:
-            if not isinstance(obj, dict):
-                continue
-            for d in [attrs(obj), obj]:
-                if not isinstance(d, dict):
-                    continue
-                for k in keys:
-                    raw = d.get(k)
-                    v = safe_float(raw, None)
-                    if v is None and isinstance(raw, str):
-                        v = _bp_extract_line_from_text(raw, market)
-                    if v is not None and mn <= v <= mx and abs(v * 2 - round(v * 2)) < 1e-9:
-                        return float(v)
-        return None
-
-    def active_ok(*objs):
-        status_blob = " ".join(str(attrs(o).get(k, "")) for o in objs if isinstance(o, dict) for k in ["status", "state", "display_status", "over_status", "under_status", "hidden", "active"]).lower()
-        return not any(x in status_blob for x in ["suspended", "removed", "hidden true", "inactive", "closed", "disabled"])
-
-    def player_from(*objs):
-        candidates = []
-        for obj in objs:
-            if not isinstance(obj, dict):
-                continue
-            a = attrs(obj)
-            first_last = (str(a.get("first_name", "")).strip() + " " + str(a.get("last_name", "")).strip()).strip()
-            for k in ["display_name", "full_name", "name", "player_name", "title", "description", "appearance_name"]:
-                v = a.get(k)
-                if isinstance(v, str):
-                    candidates.append(v)
-            if first_last.strip():
-                candidates.append(first_last)
-        # Explicit title pattern is highly reliable.
-        for c in candidates:
-            m = title_re.search(str(c))
-            if m:
-                return _bp_clean_player_name(m.group(1))
-        cleaned = []
-        for c in candidates:
-            cc = _bp_clean_player_name(c)
-            if cc and len(normalize_name(cc).split()) >= 2 and len(cc) <= 60:
-                # Avoid market names becoming players.
-                if not re.search(r"\b(Hits|RBIs?|Over|Under|Batter|Line)\b", cc, re.I):
-                    cleaned.append(cc)
-        if cleaned:
-            cleaned = sorted(set(cleaned), key=lambda x: (len(x.split()), len(x)), reverse=True)
-            return cleaned[0]
-        return ""
-
-    rows = []
-    debug_counts = {"urls": 0, "objects": 0, "line_candidates": 0, "market_hits": 0, "mlb_valid": 0}
-    for url in UNDERDOG_URLS:
-        data = safe_get_json(url, timeout=18)
-        if not data:
-            continue
-        debug_counts["urls"] += 1
-        objects = collect(data)
-        debug_counts["objects"] += len(objects)
-        by_key, by_id = build_maps(objects)
-        line_candidates = []
-        for o in objects:
-            t = typ(o, o.get("_parent_key", ""))
-            a = attrs(o)
-            if "over_under_line" in t or any(a.get(k) not in [None, ""] for k in ["stat_value", "line_score", "over_under_line", "target_value", "line"]):
-                line_candidates.append(o)
-        debug_counts["line_candidates"] += len(line_candidates)
-
-        # relationship path
-        for line_obj in line_candidates:
-            ou_obj = rel_obj(line_obj, ["over_under", "over_unders"], by_key, by_id)
-            app_obj = rel_obj(ou_obj, ["appearance", "appearances"], by_key, by_id) or rel_obj(line_obj, ["appearance", "appearances"], by_key, by_id)
-            player_obj = rel_obj(app_obj, ["player", "players"], by_key, by_id) or rel_obj(ou_obj, ["player", "players"], by_key, by_id) or rel_obj(line_obj, ["player", "players"], by_key, by_id)
-            market = classify(line_obj, ou_obj, app_obj, player_obj)
-            if not market or not active_ok(line_obj, ou_obj, app_obj, player_obj):
-                continue
-            line = line_from(line_obj, ou_obj, app_obj, market=market)
-            if line is None:
-                continue
-            player = player_from(player_obj, app_obj, ou_obj, line_obj)
-            if not player:
-                continue
-            debug_counts["market_hits"] += 1
-            if not _mlb_search_player_id_by_name(player):
-                continue
-            debug_counts["mlb_valid"] += 1
-            rows.append({"Source":"Underdog","Player":player.strip(),"Market":market,"Market Label":BATTER_PROP_MARKETS[market]["label"],"Line":float(line),"Evidence":text_from(line_obj, ou_obj, app_obj, player_obj)[:260]})
-
-        # exact-title fallback across all objects if relationship path missed titles
-        for obj in objects:
-            blob = text_from(obj)
-            if not blob or bad_re.search(blob):
-                continue
-            m = title_re.search(blob)
-            if not m:
-                continue
-            market = "RBI" if m.group(2).lower().startswith("rbi") else "HITS"
-            line = line_from(obj, market=market)
-            if line is None:
-                # Only parse close to the title, not the whole nested JSON.
-                start = max(0, m.start() - 80); end = min(len(blob), m.end() + 180)
-                line = _bp_extract_line_from_text(blob[start:end], market)
-            if line is None:
-                continue
-            player = _bp_clean_player_name(m.group(1))
-            if not player or len(normalize_name(player).split()) < 2:
-                continue
-            debug_counts["market_hits"] += 1
-            if not _mlb_search_player_id_by_name(player):
-                continue
-            debug_counts["mlb_valid"] += 1
-            rows.append({"Source":"Underdog","Player":player.strip(),"Market":market,"Market Label":BATTER_PROP_MARKETS[market]["label"],"Line":float(line),"Evidence":"exact title fallback: " + blob[:240]})
-
-    # Keep debug info in session for the UI when empty.
-    try:
-        st.session_state["batter_prop_ud_debug"] = debug_counts
-    except Exception:
-        pass
-
-    dedup = {}
-    for r in rows:
-        key = (normalize_name(r.get("Player")), r.get("Market"))
-        # If duplicate, prefer source/evidence with an explicit title fallback or smaller line sanity.
-        if key not in dedup:
-            dedup[key] = r
-    return list(dedup.values())
 
 def build_batter_prop_board(market):
     rows = [r for r in fetch_underdog_batter_prop_rows() if r.get("Market") == market]
@@ -11462,7 +10701,7 @@ def build_batter_prop_board(market):
         return pd.DataFrame()
     df = pd.DataFrame(out)
     # Keep mobile table compact.
-    cols = ["Player", "Market Label", "Line", "Projection", "Edge", "Decision", "Confidence %", "OBP", "Contact%", "K%", "BABIP", "Lineup Slot", "OBP Ahead", "Moneyball Score", "RBI Opp Score", "Team Run Env", "Team BaseRuns/G", "Pitcher Hit Score", "Bullpen Hit Score", "RISP Score", "Recent Avg", "Recent Hit Rate %", "Attribution", "Source"]
+    cols = ["Player", "Market Label", "Line", "Projection", "Edge", "Decision", "Confidence %", "OBP", "Contact%", "K%", "BABIP", "Moneyball Score", "RBI Opp Score", "Team Run Env", "Team BaseRuns/G", "Recent Avg", "Recent Hit Rate %", "Source"]
     cols = [c for c in cols if c in df.columns]
     df = df[cols].sort_values(["Decision", "Confidence %", "Edge"], ascending=[True, False, False])
     return df
@@ -11502,15 +10741,7 @@ def render_batter_prop_tab(market):
             <div class="kpi-box"><div class="kpi-label">Value Score</div><div class="kpi-value">{r.get('Moneyball Score','—')}</div><div class="kpi-sub">Hits model</div></div>
             <div class="kpi-box"><div class="kpi-label">RBI Opp</div><div class="kpi-value">{r.get('RBI Opp Score','—')}</div><div class="kpi-sub">RBI model</div></div>
             <div class="kpi-box"><div class="kpi-label">Team Run Env</div><div class="kpi-value">{r.get('Team Run Env','—')}</div><div class="kpi-sub">BsR {r.get('Team BaseRuns/G','—')}/G</div></div>
-            <div class="kpi-box"><div class="kpi-label">Lineup Slot</div><div class="kpi-value">{r.get('Lineup Slot','—')}</div><div class="kpi-sub">PA/RBI context</div></div>
-            <div class="kpi-box"><div class="kpi-label">OBP Ahead</div><div class="kpi-value">{r.get('OBP Ahead','—')}</div><div class="kpi-sub">RBI chances</div></div>
-            <div class="kpi-box"><div class="kpi-label">Pitcher/BP</div><div class="kpi-value">{r.get('Pitcher Hit Score','—')}/{r.get('Bullpen Hit Score','—')}</div><div class="kpi-sub">Hit/run allowance</div></div>
-            <div class="kpi-box"><div class="kpi-label">RISP</div><div class="kpi-value">{r.get('RISP Score','—')}</div><div class="kpi-sub">RBI support</div></div>
             <div class="kpi-box"><div class="kpi-label">L10 Rate</div><div class="kpi-value">{r.get('Recent Hit Rate %','—')}%</div></div>
-          </div>
-          <div style="margin-top:10px;padding:10px;border:1px solid #1f2a34;border-radius:12px;background:#0b0f14;">
-            <div class="small-muted">Attribution</div>
-            <div style="font-size:13px;font-weight:700;line-height:1.35;">{html.escape(str(r.get('Attribution','—')))}</div>
           </div>
         </div>
         """, unsafe_allow_html=True)
