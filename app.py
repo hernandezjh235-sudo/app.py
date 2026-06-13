@@ -21181,6 +21181,162 @@ def render_line_aware_hit_rate_panel():
     except Exception as e:
         st.info(f"Line-aware hit rate waiting: {e}")
 
+
+# =========================
+# OFFICIAL BOARD PERSISTENCE PATCH
+# Version: OFFICIAL_BOARD_PERSISTENCE_PATCH_2026_06_13
+#
+# Fixes: saved board not loading after app close/reopen.
+# Saves and loads latest official board from learning_data/saved_boards/latest_official_board.csv.
+# Does NOT change projection math.
+# =========================
+OFFICIAL_BOARD_PERSISTENCE_PATCH_VERSION = "OFFICIAL_BOARD_PERSISTENCE_PATCH_2026_06_13"
+
+def _obp_dir():
+    d = Path("learning_data") / "saved_boards"
+    try:
+        d.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        pass
+    return d
+
+def _obp_latest_path():
+    return _obp_dir() / "latest_official_board.csv"
+
+def _obp_find_current_board():
+    for key in [
+        "official_saved_board",
+        "saved_board",
+        "loaded_picks",
+        "kproj_board",
+        "current_k_board",
+        "projection_board",
+        "latest_projection_board",
+    ]:
+        try:
+            v = st.session_state.get(key)
+            if isinstance(v, pd.DataFrame) and not v.empty:
+                return v.copy()
+        except Exception:
+            pass
+    try:
+        if "build_kproj_table" in globals() and "board" in globals():
+            v = build_kproj_table(board)
+            if isinstance(v, pd.DataFrame) and not v.empty:
+                return v.copy()
+    except Exception:
+        pass
+    return pd.DataFrame()
+
+def _obp_save_latest_board(df=None):
+    try:
+        if df is None or not isinstance(df, pd.DataFrame) or df.empty:
+            df = _obp_find_current_board()
+        if df is None or df.empty:
+            return False, "No current board found to save."
+
+        path = _obp_latest_path()
+        df.to_csv(path, index=False)
+
+        try:
+            stamp = pd.Timestamp.now().strftime("%Y%m%d_%H%M%S")
+            archive = _obp_dir() / f"official_board_{stamp}.csv"
+            df.to_csv(archive, index=False)
+        except Exception:
+            pass
+
+        st.session_state["official_saved_board"] = df.copy()
+        st.session_state["saved_board"] = df.copy()
+        st.session_state["loaded_picks"] = df.copy()
+        st.session_state["official_save_loaded"] = True
+        st.session_state["latest_saved_board_path"] = str(path)
+        return True, f"Saved {len(df)} rows."
+    except Exception as e:
+        return False, f"Save failed: {e}"
+
+def _obp_load_latest_board():
+    try:
+        path = _obp_latest_path()
+        if not path.exists():
+            return False, "No saved board file found yet."
+        df = pd.read_csv(path)
+        if df.empty:
+            return False, "Saved board file is empty."
+        st.session_state["official_saved_board"] = df.copy()
+        st.session_state["saved_board"] = df.copy()
+        st.session_state["loaded_picks"] = df.copy()
+        st.session_state["official_save_loaded"] = True
+        st.session_state["latest_saved_board_path"] = str(path)
+        return True, f"Loaded {len(df)} saved rows."
+    except Exception as e:
+        return False, f"Load failed: {e}"
+
+def _obp_autoload():
+    try:
+        if not st.session_state.get("_obp_autoload_done", False):
+            st.session_state["_obp_autoload_done"] = True
+            ok, msg = _obp_load_latest_board()
+            st.session_state["_obp_autoload_ok"] = ok
+            st.session_state["_obp_autoload_msg"] = msg
+    except Exception:
+        pass
+
+try:
+    _obp_autoload()
+except Exception:
+    pass
+
+def render_official_board_persistence_panel():
+    st.markdown("### 💾 Official Board Save / Load")
+    _obp_autoload()
+    msg = st.session_state.get("_obp_autoload_msg", "")
+    if st.session_state.get("_obp_autoload_ok", False):
+        st.success(msg)
+    else:
+        st.info(msg or "No saved board loaded.")
+
+    c1, c2 = st.columns(2)
+    with c1:
+        if st.button("💾 Save Current Board", key="obp_save_current_board_btn"):
+            ok, msg = _obp_save_latest_board()
+            if ok:
+                st.success(msg)
+            else:
+                st.error(msg)
+    with c2:
+        if st.button("🔄 Load Latest Board", key="obp_load_latest_board_btn"):
+            ok, msg = _obp_load_latest_board()
+            if ok:
+                st.success(msg)
+            else:
+                st.warning(msg)
+
+    df = st.session_state.get("official_saved_board")
+    if isinstance(df, pd.DataFrame) and not df.empty:
+        st.caption(f"Saved board in memory: {len(df)} rows")
+        st.dataframe(df.head(100), use_container_width=True, hide_index=True)
+
+
+# Wrap common official save functions so older save buttons also persist to disk.
+try:
+    for _obp_name in ["save_official_before_game_snapshot", "save_official_snapshot", "save_before_game_snapshot", "save_current_board", "save_board"]:
+        if _obp_name in globals() and callable(globals()[_obp_name]) and not getattr(globals()[_obp_name], "_obp_wrapped", False):
+            _obp_old = globals()[_obp_name]
+            def _obp_make_wrap(fn):
+                def _obp_wrap(*args, **kwargs):
+                    result = fn(*args, **kwargs)
+                    try:
+                        df = args[0] if args and isinstance(args[0], pd.DataFrame) else None
+                        _obp_save_latest_board(df)
+                    except Exception:
+                        pass
+                    return result
+                _obp_wrap._obp_wrapped = True
+                return _obp_wrap
+            globals()[_obp_name] = _obp_make_wrap(_obp_old)
+except Exception:
+    pass
+
 tab_kproj, tab_pitcher_fs, tab_moneyline, tab_mlb30_puller, tab_fs_ud_watcher, tab_iq, tab_30d_learning, tab_learning_lab, tab_calibration, tab2, tab3, tab4, tab5, tab6 = st.tabs([
     "K PROJ / UPSIDE",
     "PITCHER FS",
