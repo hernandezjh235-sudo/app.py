@@ -347,6 +347,19 @@ h1,h2,h3 {color:#fff;}
 </style>
 """, unsafe_allow_html=True)
 
+
+# =========================
+# V3 STREAMLIT WIDGET KEY SAFETY
+# Prevents duplicate selectbox keys when Research Hub and standalone batter tabs render in the same Streamlit run.
+# UI-only fix; does not touch projection math.
+# =========================
+_V3_WIDGET_KEY_COUNTS = {}
+def _v3_unique_widget_key(base):
+    base = str(base)
+    n = _V3_WIDGET_KEY_COUNTS.get(base, 0) + 1
+    _V3_WIDGET_KEY_COUNTS[base] = n
+    return f"{base}_{n}"
+
 # =========================
 # HELPERS
 # =========================
@@ -22469,7 +22482,7 @@ def render_research_hub_tab(board):
 
     st.subheader("Clickable Player Cards")
     names = df["Pitcher"].dropna().astype(str).tolist()
-    selected = st.selectbox("Open player research card", names, key="research_hub_player_select")
+    selected = st.selectbox("Open player research card", names, key=_v3_unique_widget_key("research_hub_player_select"))
     rr = df[df["Pitcher"].astype(str) == selected].iloc[0].to_dict()
     kline = _rh_num(rr.get("K Line"), None)
     with st.expander(f"{selected} — Full K/FS Research Card", expanded=True):
@@ -22991,7 +23004,7 @@ def render_v3_batter_research_tab(market="FS"):
     st.dataframe(df[cols].sort_values(["Sync Score","Edge"], ascending=[False, False], na_position="last"), use_container_width=True, hide_index=True)
 
     names = df["Player"].dropna().astype(str).tolist()
-    selected = st.selectbox(f"Open {title} card", names, key=f"v3_batter_research_select_{market}")
+    selected = st.selectbox(f"Open {title} card", names, key=_v3_unique_widget_key(f"v3_batter_research_select_{market}"))
     rr = df[df["Player"].astype(str)==selected].iloc[0].to_dict()
     with st.expander(f"{selected} — {title} Card", expanded=True):
         a,b,c,d,e = st.columns(5)
@@ -23056,7 +23069,7 @@ def render_research_hub_tab(board):
 
                 st.subheader("Clickable Pitcher Cards")
                 names = df["Pitcher"].dropna().astype(str).tolist()
-                selected = st.selectbox("Open pitcher research card", names, key="research_hub_player_select_v3_final")
+                selected = st.selectbox("Open pitcher research card", names, key=_v3_unique_widget_key("research_hub_player_select_v3_final"))
                 rr = df[df["Pitcher"].astype(str) == selected].iloc[0].to_dict()
                 kline = _v3_safe_num(rr.get("K Line"), None)
                 with st.expander(f"{selected} — Full K/FS Research Card", expanded=True):
@@ -23103,12 +23116,377 @@ def render_research_hub_tab(board):
         render_v3_batter_research_tab("HRR")
 
 
+
+# =========================
+# MLB PROP V3 ENGINE — CLEAN WORKFLOW + UNIVERSAL RESEARCH CARDS
+# Version: MLB_PROP_V3_CLEAN_WORKFLOW_2026_06_16
+# Research/display layer only. Does not overwrite K, FS, HRR projections.
+# =========================
+MLB_PROP_V3_CLEAN_WORKFLOW_VERSION = "MLB_PROP_V3_CLEAN_WORKFLOW_2026_06_16"
+
+# Preserve existing builders so this layer can enhance output without breaking base math.
+_v3_base_pitcher_research_builder = globals().get("build_research_hub_table")
+_v3_base_batter_research_builder = globals().get("build_v3_batter_research_table")
+
+def _v3_pct_from_rate_text(x):
+    try:
+        a,b = str(x or "").replace(" ","").split("/")[:2]
+        return float(a) / max(1.0, float(b)) * 100.0
+    except Exception:
+        return None
+
+
+def _v3_conf_lineup_status_from_row(row, kind="pitcher"):
+    """Best-effort confirmed lineup/starter status for display only."""
+    raw = row.get("Raw") if isinstance(row, dict) else {}
+    blob = " ".join(str(v) for v in list((row or {}).values())[:80])
+    if isinstance(raw, dict):
+        blob += " " + " ".join(str(v) for v in raw.values())
+    b = blob.lower()
+    if kind == "pitcher":
+        if any(x in b for x in ["confirmed starter", "pitcher_confirmed true", "confirmed', true", "confirmed\": true"]):
+            return "✅ CONFIRMED STARTER"
+        if any(x in b for x in ["probable", "projected", "mlb projected"]):
+            return "🟡 PROBABLE / PROJECTED STARTER"
+        if any(x in b for x in ["opener", "bulk", "swingman", "spot start"]):
+            return "🔴 ROLE WATCH"
+        return "🟡 STARTER STATUS: VERIFY"
+    # Batter side: historical logs are not today's confirmed lineup.
+    if any(x in b for x in ["confirmed lineup", "lineup confirmed", "batting order confirmed", "locked lineup"]):
+        return "✅ CONFIRMED LINEUP"
+    if any(x in b for x in ["not in lineup", "bench", "out of lineup"]):
+        return "🔴 NOT CONFIRMED / BENCH RISK"
+    if any(x in b for x in ["lineup slot", "projected", "expected batting", "probable"]):
+        return "🟡 PROJECTED — VERIFY LINEUP"
+    return "🟡 VERIFY LINEUP BEFORE LOCK"
+
+
+def _v3_pitcher_matchup_summary(row):
+    """Readable matchup summary for pitcher research. Uses loaded columns only."""
+    opp = str(row.get("Opponent") or row.get("Matchup") or "opponent")
+    hand = str(row.get("Pitcher Hand") or row.get("Hand") or "UNK").upper()
+    # Pull best-effort opponent K fields if present.
+    opp_k = None
+    for k in ["Opponent K%", "Opp K%", "Lineup K%", "Season Opponent K", "Opp K", "Opponent K"]:
+        v = _v3_safe_num(row.get(k), None) if '_v3_safe_num' in globals() else safe_float(row.get(k), None)
+        if v is not None:
+            opp_k = v if v > 1 else v * 100
+            break
+    vs_l = None; vs_r = None
+    for k in ["Opp K% vs LHP", "Opponent K% vs LHP", "vs LHP K%", "Team K% vs LHP", "K% vs LHP"]:
+        v = _v3_safe_num(row.get(k), None) if '_v3_safe_num' in globals() else safe_float(row.get(k), None)
+        if v is not None:
+            vs_l = v if v > 1 else v * 100; break
+    for k in ["Opp K% vs RHP", "Opponent K% vs RHP", "vs RHP K%", "Team K% vs RHP", "K% vs RHP"]:
+        v = _v3_safe_num(row.get(k), None) if '_v3_safe_num' in globals() else safe_float(row.get(k), None)
+        if v is not None:
+            vs_r = v if v > 1 else v * 100; break
+    split = vs_l if hand.startswith("L") else vs_r if hand.startswith("R") else opp_k
+    used = "vs LHP" if hand.startswith("L") else "vs RHP" if hand.startswith("R") else "overall"
+    if split is None:
+        grade = "🟡 Neutral / missing handedness data"
+        note = "No loaded LHP/RHP split; use overall matchup context and Research Hub trends."
+    elif split >= 24.5:
+        grade = "🟢 Favorable K matchup"
+        note = f"Opponent is K-friendly {used} at {split:.1f}%."
+    elif split <= 19.5:
+        grade = "🔴 Difficult K matchup"
+        note = f"Opponent is contact-heavy {used} at {split:.1f}%."
+    else:
+        grade = "🟡 Neutral K matchup"
+        note = f"Opponent {used} K rate is {split:.1f}%."
+    parts = [grade, note]
+    if opp_k is not None:
+        parts.append(f"Overall K%: {opp_k:.1f}%")
+    if vs_l is not None:
+        parts.append(f"vs LHP: {vs_l:.1f}%")
+    if vs_r is not None:
+        parts.append(f"vs RHP: {vs_r:.1f}%")
+    return " | ".join(parts)
+
+
+def _v3_pitcher_line_sensitivity(proj, line):
+    proj = _v3_safe_num(proj, None)
+    line = _v3_safe_num(line, None)
+    if proj is None or line is None:
+        return "Line sensitivity unavailable."
+    checks = [line - 1.0, line - 0.5, line, line + 0.5, line + 1.0]
+    out = []
+    for ln in checks:
+        if ln < 0: continue
+        edge = proj - ln
+        if edge >= 1.25: lab = "Strong Over zone"
+        elif edge >= 0.50: lab = "Over lean"
+        elif edge > -0.50: lab = "Thin / pass zone"
+        elif edge > -1.25: lab = "Under lean"
+        else: lab = "Strong Under zone"
+        out.append(f"{ln:g}: {lab} ({edge:+.2f})")
+    return " | ".join(out)
+
+
+def _v3_official_play_filter(row, market="K"):
+    """Research-only official filter. Does not change saved/engine decisions."""
+    edge_key = "K Edge" if market == "K" else "Edge"
+    edge = _v3_safe_num(row.get(edge_key), 0) or 0
+    sync = _v3_safe_num(row.get("Sync Score"), None)
+    role = _v3_safe_num(row.get("Role Stability"), 75) or 75
+    lineup_status = str(row.get("Confirmed Lineup Status") or "").upper()
+    abs_edge = abs(edge)
+    # Market thresholds: HRR is lower variance scale than FS/K.
+    if market == "HRR":
+        min_edge = 0.35
+    elif market == "Batter FS":
+        min_edge = 1.00
+    else:
+        min_edge = 0.50
+    if "NOT CONFIRMED" in lineup_status or "BENCH" in lineup_status:
+        return "🚫 PASS — LINEUP RISK"
+    if abs_edge < min_edge:
+        return "🚫 PASS — EDGE THIN"
+    if sync is not None and sync < 48:
+        return "🚫 PASS — AGAINST TREND"
+    if market == "K" and role < 48:
+        return "🚫 PASS — ROLE / LEASH RISK"
+    if sync is not None and sync >= 75 and abs_edge >= min_edge * 1.5:
+        return "✅ OFFICIAL PLAY CANDIDATE"
+    return "⚠️ LEAN — VERIFY CONTEXT"
+
+
+def _v3_pitcher_good_bad_verdict(row):
+    pick = str(row.get("K Pick") or "").upper()
+    proj = _v3_safe_num(row.get("K Projection"), None)
+    line = _v3_safe_num(row.get("K Line"), None)
+    edge = _v3_safe_num(row.get("K Edge"), None)
+    sync = _v3_safe_num(row.get("Sync Score"), None)
+    role = _v3_safe_num(row.get("Role Stability"), None)
+    good, bad = [], []
+    if proj is not None and line is not None and edge is not None:
+        if (pick == "OVER" and edge > 0) or (pick == "UNDER" and edge < 0):
+            good.append(f"Board projection supports {pick}: {proj:g} vs {line:g} ({edge:+.2f}).")
+        else:
+            bad.append(f"Projection does not strongly support {pick}: {proj:g} vs {line:g} ({edge:+.2f}).")
+        if abs(edge) < 0.35:
+            bad.append("True edge is thin; better as a pass/lean than a forced play.")
+    for label in ["Last 5", "Last 10", "Same-Line", "Home/Away", "H2H"]:
+        txt = row.get(label)
+        pct = _v3_pct_from_rate_text(txt)
+        if pct is None: continue
+        if pct >= 65: good.append(f"{label} supports the {pick}: {txt}.")
+        elif pct <= 35: bad.append(f"{label} is against the {pick}: {txt}.")
+    if role is not None:
+        if role >= 78: good.append(f"Role stability is strong ({int(role)}/100).")
+        elif role < 48: bad.append(f"Role/leash risk is elevated ({int(role)}/100).")
+    if sync is not None:
+        if sync >= 75: good.append(f"Sync Score shows strong agreement ({sync:g}%).")
+        elif sync < 48: bad.append(f"Sync Score is against trend ({sync:g}%).")
+    if not good: good.append("No major positive edge beyond having a posted board line.")
+    if not bad: bad.append("No major red flags from loaded logs.")
+    verdict = _v3_official_play_filter(row, "K")
+    return good[:5], bad[:5], verdict
+
+
+def _v3_improve_sync_score(row, market="K"):
+    """Projection-first Sync Score improvement. Research-only score."""
+    if market == "K":
+        edge = _v3_safe_num(row.get("K Edge"), 0) or 0
+        line = _v3_safe_num(row.get("K Line"), None)
+        proj = _v3_safe_num(row.get("K Projection"), None)
+    else:
+        edge = _v3_safe_num(row.get("Edge"), 0) or 0
+        line = _v3_safe_num(row.get("Line"), None)
+        proj = _v3_safe_num(row.get("Projection"), None)
+    parts = []
+    # Projection edge gets the highest weight.
+    if line is not None and proj is not None:
+        edge_strength = clamp(abs(edge) / max(1.0, float(line) * 0.22), 0.0, 1.0)
+        parts.append((edge_strength, 40))
+    for key, wt in [("Last 5", 13), ("Last 10", 18), ("Last 15", 9), ("Home/Away", 8), ("H2H", 6), ("Same-Line", 10)]:
+        pct = _v3_pct_from_rate_text(row.get(key))
+        if pct is not None:
+            parts.append((pct / 100.0, wt))
+    # Role/lineup context.
+    role = _v3_safe_num(row.get("Role Stability"), None)
+    if role is not None and market == "K":
+        parts.append((clamp(role / 100.0, 0, 1), 10))
+    lstat = str(row.get("Confirmed Lineup Status") or "").upper()
+    if market != "K":
+        if "CONFIRMED" in lstat: parts.append((1.0, 8))
+        elif "VERIFY" in lstat or "PROJECTED" in lstat: parts.append((0.60, 8))
+        elif "NOT" in lstat or "BENCH" in lstat: parts.append((0.0, 8))
+    if not parts:
+        return row.get("Sync Score"), row.get("Sync Label")
+    sync = round(sum(v*w for v,w in parts) / max(1, sum(w for _,w in parts)) * 100, 1)
+    label = "STRONG AGREEMENT" if sync >= 75 else "GOOD AGREEMENT" if sync >= 62 else "MIXED" if sync >= 48 else "AGAINST TREND"
+    return sync, label
+
+
+def build_research_hub_table(board):
+    base_builder = _v3_base_pitcher_research_builder
+    df = base_builder(board) if callable(base_builder) else pd.DataFrame()
+    if df is None or df.empty:
+        return pd.DataFrame()
+    d = df.copy()
+    # Add universal fields without touching projections.
+    d["Confirmed Lineup Status"] = d.apply(lambda r: _v3_conf_lineup_status_from_row(r.to_dict(), "pitcher"), axis=1)
+    d["Matchup Summary"] = d.apply(lambda r: _v3_pitcher_matchup_summary(r.to_dict()), axis=1)
+    d["Line Sensitivity"] = d.apply(lambda r: _v3_pitcher_line_sensitivity(r.get("K Projection"), r.get("K Line")), axis=1)
+    new_sync = d.apply(lambda r: _v3_improve_sync_score(r.to_dict(), "K"), axis=1)
+    d["Sync Score"] = [x[0] for x in new_sync]
+    d["Sync Label"] = [x[1] for x in new_sync]
+    d["Official Play Filter"] = d.apply(lambda r: _v3_official_play_filter(r.to_dict(), "K"), axis=1)
+    d["Good Points"] = d.apply(lambda r: " | ".join(_v3_pitcher_good_bad_verdict(r.to_dict())[0]), axis=1)
+    d["Bad Points"] = d.apply(lambda r: " | ".join(_v3_pitcher_good_bad_verdict(r.to_dict())[1]), axis=1)
+    d["Research Version"] = MLB_PROP_V3_CLEAN_WORKFLOW_VERSION
+    return d
+
+
+def build_v3_batter_research_table(market="FS"):
+    base_builder = _v3_base_batter_research_builder
+    df = base_builder(market) if callable(base_builder) else pd.DataFrame()
+    if df is None or df.empty:
+        return pd.DataFrame()
+    d = df.copy()
+    mlabel = "Batter FS" if str(market).upper() == "FS" else "HRR"
+    d["Confirmed Lineup Status"] = d.apply(lambda r: _v3_conf_lineup_status_from_row(r.to_dict(), "batter"), axis=1)
+    d["Matchup Summary"] = d.apply(lambda r: f"Opponent/H2H: {r.get('H2H','—')} | Split: {r.get('Home/Away','—')} | Verify today's lineup slot before locking.", axis=1)
+    new_sync = d.apply(lambda r: _v3_improve_sync_score(r.to_dict(), "Batter FS" if mlabel == "Batter FS" else "HRR"), axis=1)
+    d["Sync Score"] = [x[0] for x in new_sync]
+    d["Sync Label"] = [x[1] for x in new_sync]
+    d["Official Play Filter"] = d.apply(lambda r: _v3_official_play_filter(r.to_dict(), "Batter FS" if mlabel == "Batter FS" else "HRR"), axis=1)
+    return d
+
+
+def render_v3_batter_research_tab(market="FS"):
+    title = "Batter FS Research" if str(market).upper()=="FS" else "H+R+RBI Research"
+    st.markdown(f'<div class="section-title-pro">🧪 {title} — Underdog Posted Lines Only</div>', unsafe_allow_html=True)
+    st.caption("Opening Day batter logs + active Underdog posted lines only. No Underdog line = player is hidden. Research layer only.")
+    df = build_v3_batter_research_table(market)
+    if df.empty:
+        st.warning("No active Underdog lines matched to loaded batter logs. Confirm the batter CSV is in learning_data and Underdog has this market posted.")
+        with st.expander("Expected batter log columns"):
+            st.write(["Date","Player","Team","Opponent","Home/Away","PA","AB","H","R","RBI","Fantasy Score"])
+        return
+    c1,c2,c3,c4,c5 = st.columns(5)
+    c1.metric("Rows", len(df))
+    c2.metric("Official Candidates", int(df.get("Official Play Filter", pd.Series(dtype=str)).astype(str).str.contains("OFFICIAL", na=False).sum()))
+    c3.metric("Strong Sync", int((pd.to_numeric(df.get("Sync Score"), errors="coerce") >= 75).sum()))
+    c4.metric("Overs", int((df["Pick"].astype(str)=="OVER").sum()))
+    c5.metric("Unders", int((df["Pick"].astype(str)=="UNDER").sum()))
+    cols=[c for c in ["Player","Market","Pick","Line","Projection","Edge","Official Play Filter","Confirmed Lineup Status","Last 5","Last 10","Home/Away","H2H","Matchup Summary","Sync Score","Sync Label"] if c in df.columns]
+    st.dataframe(df[cols].sort_values(["Sync Score","Edge"], ascending=[False, False], na_position="last"), use_container_width=True, hide_index=True)
+    names = df["Player"].dropna().astype(str).tolist()
+    selected = st.selectbox(f"Open {title} card", names, key=_v3_unique_widget_key(f"v3_batter_research_select_clean_{market}"))
+    rr = df[df["Player"].astype(str)==selected].iloc[0].to_dict()
+    with st.expander(f"{selected} — {title} Card", expanded=True):
+        a,b,c,d,e,f = st.columns(6)
+        a.metric("Projection", rr.get("Projection","—"))
+        b.metric("Line", rr.get("Line","—"))
+        c.metric("Pick", rr.get("Pick","—"))
+        d.metric("Edge", rr.get("Edge","—"))
+        e.metric("Sync", f"{rr.get('Sync Score')}%")
+        f.metric("Filter", rr.get("Official Play Filter","—"))
+        st.markdown("**Last 10 Results**", unsafe_allow_html=True)
+        st.markdown(_v3_bar_html_vals(rr.get("Recent Values") or [], rr.get("Line"), rr.get("Pick")), unsafe_allow_html=True)
+        st.markdown("### Matchup Summary")
+        st.info(rr.get("Matchup Summary", "—"))
+        st.markdown("### Confirmed Lineup Status")
+        st.warning(rr.get("Confirmed Lineup Status", "VERIFY LINEUP"))
+        good, bad = _v3_good_bad_lists(rr)
+        st.markdown("### The Good")
+        for g in good:
+            st.markdown(f"✅ {g}")
+        st.markdown("### The Bad")
+        for btxt in bad:
+            st.markdown(f"❌ {btxt}" if "No major" not in btxt else f"⚠️ {btxt}")
+        st.markdown("### Hit Rate / Splits")
+        st.write({"Last 5": rr.get("Last 5"), "Last 10": rr.get("Last 10"), "Last 15": rr.get("Last 15"), "Average": rr.get("Average"), "Median": rr.get("Median"), "Home/Away": rr.get("Home/Away"), "H2H": rr.get("H2H")})
+        st.markdown("### Line Sensitivity")
+        st.info(rr.get("Line Sensitivity"))
+        st.markdown("### Outlier-Style Verdict")
+        filt = rr.get("Official Play Filter", "LEAN")
+        if "OFFICIAL" in str(filt):
+            st.success(f"{filt}: {rr.get('Pick')} | Projection {rr.get('Projection')} vs Line {rr.get('Line')} | Sync {rr.get('Sync Score')}%")
+        else:
+            st.warning(f"{filt}: {rr.get('Pick')} lean | Projection {rr.get('Projection')} vs Line {rr.get('Line')} | Sync {rr.get('Sync Score')}%")
+
+
+def render_research_hub_tab(board):
+    st.markdown('<div class="section-title-pro">🔎 MLB PROP V3 RESEARCH HUB</div>', unsafe_allow_html=True)
+    st.caption("Clean workflow: Pitcher K/FS → Batter FS → H+R+RBI. Research only; projections and official engine decisions are not overwritten.")
+    st.info("Workflow: 1) Pull posted lines → 2) Match logs → 3) Build projection context → 4) Check Research Hub → 5) Official Play Filter flags candidate/pass.")
+    rtabs = st.tabs(["1️⃣ Pitching Research", "2️⃣ Batter FS Research", "3️⃣ H+R+RBI Research"])
+    with rtabs[0]:
+        if not board:
+            st.info("Refresh or load the pitcher board first.")
+        else:
+            df = build_research_hub_table(board)
+            if df.empty:
+                st.warning("No pitcher research rows found. Load Season Data / Pitch.csv first, then refresh the board.")
+            else:
+                c1, c2, c3, c4, c5 = st.columns(5)
+                c1.metric("Rows", len(df))
+                c2.metric("Official Candidates", int(df.get("Official Play Filter", pd.Series(dtype=str)).astype(str).str.contains("OFFICIAL", na=False).sum()))
+                c3.metric("Strong Sync", int((pd.to_numeric(df.get("Sync Score"), errors="coerce") >= 75).sum()))
+                c4.metric("Role Watch", int((pd.to_numeric(df.get("Role Stability"), errors="coerce") < 63).sum()))
+                c5.metric("Version", "Clean V3")
+                cols = [c for c in [
+                    "Pitcher", "Matchup", "K Pick", "K Line", "K Projection", "K Edge", "Official Play Filter", "Confirmed Lineup Status",
+                    "Matchup Summary", "Last 5", "Last 10", "Home/Away", "H2H", "Same-Line", "Role Label", "Sync Score", "Sync Label"
+                ] if c in df.columns]
+                st.dataframe(df[cols].sort_values(["Sync Score", "K Edge"], ascending=[False, False], na_position="last"), use_container_width=True, hide_index=True)
+                st.subheader("Clickable Pitcher Cards")
+                names = df["Pitcher"].dropna().astype(str).tolist()
+                selected = st.selectbox("Open pitcher research card", names, key=_v3_unique_widget_key("research_hub_player_select_v3_clean"))
+                rr = df[df["Pitcher"].astype(str) == selected].iloc[0].to_dict()
+                kline = _v3_safe_num(rr.get("K Line"), None)
+                good, bad, verdict = _v3_pitcher_good_bad_verdict(rr)
+                with st.expander(f"{selected} — Full K/FS Research Card", expanded=True):
+                    a,b,c,d,e,f,g = st.columns(7)
+                    a.metric("Board K Projection", rr.get("K Projection", "—"))
+                    b.metric("K Line", rr.get("K Line", "—"))
+                    c.metric("K Edge", rr.get("K Edge", "—"))
+                    d.metric("FS Projection", rr.get("FS Projection", "—"))
+                    e.metric("Sync", "—" if rr.get("Sync Score") is None else f"{rr.get('Sync Score')}%")
+                    f.metric("Filter", rr.get("Official Play Filter", "—"))
+                    g.metric("Role", rr.get("Role Stability", "—"))
+                    st.markdown("### Matchup Summary")
+                    st.info(rr.get("Matchup Summary", "—"))
+                    st.markdown("### Confirmed Lineup / Role Status")
+                    st.warning(rr.get("Confirmed Lineup Status", "VERIFY"))
+                    st.markdown("**Last 10 K Results**", unsafe_allow_html=True)
+                    st.markdown(_rh_bar_html(rr.get("Recent Ks") or [], kline), unsafe_allow_html=True)
+                    st.markdown("**Recent Estimated FS Results**", unsafe_allow_html=True)
+                    st.markdown(_rh_bar_html(rr.get("Recent FS") or [], rr.get("FS Projection")), unsafe_allow_html=True)
+                    st.markdown("### The Good")
+                    for gtxt in good:
+                        st.markdown(f"✅ {gtxt}")
+                    st.markdown("### The Bad")
+                    for btxt in bad:
+                        st.markdown(f"❌ {btxt}" if "No major" not in btxt else f"⚠️ {btxt}")
+                    st.markdown("### Hit Rate / Splits")
+                    h1, h2 = st.columns(2)
+                    with h1:
+                        st.write({"Last 5": rr.get("Last 5"), "Last 10": rr.get("Last 10"), "Last 15": rr.get("Last 15"), "Same-Line": rr.get("Same-Line"), "Home/Away": rr.get("Home/Away"), "H2H": rr.get("H2H"), "H2H Ks": rr.get("H2H Ks")})
+                    with h2:
+                        st.write({"Recent IP Trend": rr.get("Recent IP Trend"), "Last 5 IP": rr.get("Last 5 IP"), "Last 10 IP": rr.get("Last 10 IP"), "Role Stability": rr.get("Role Stability"), "Role Label": rr.get("Role Label"), "Odds Comparison": rr.get("Odds Comparison"), "Data Source": rr.get("Data Source")})
+                    st.markdown("### Line Sensitivity")
+                    st.info(rr.get("Line Sensitivity", "—"))
+                    st.markdown("### Outlier-Style Verdict")
+                    if "OFFICIAL" in str(verdict):
+                        st.success(f"{verdict}: {rr.get('K Pick')} | Projection {rr.get('K Projection')} vs Line {rr.get('K Line')} | Sync {rr.get('Sync Score')}%")
+                    else:
+                        st.warning(f"{verdict}: {rr.get('K Pick')} lean | Projection {rr.get('K Projection')} vs Line {rr.get('K Line')} | Sync {rr.get('Sync Score')}%")
+    with rtabs[1]:
+        render_v3_batter_research_tab("FS")
+    with rtabs[2]:
+        render_v3_batter_research_tab("HRR")
+
 tab_kproj, tab_pitcher_fs, tab_research_hub, tab_batter_fs, tab_hrr, tab_moneyline, tab_mlb30_puller, tab_fs_ud_watcher, tab_iq, tab_30d_learning, tab_learning_lab, tab_calibration, tab2, tab3, tab4, tab5, tab6 = st.tabs([
-    "K PROJ / UPSIDE",
-    "PITCHER FS",
+    "1️⃣ PITCHER K",
+    "2️⃣ PITCHER FS",
     "🔎 RESEARCH HUB",
-    "BATTER FS",
-    "H+R+RBI",
+    "3️⃣ BATTER FS",
+    "4️⃣ H+R+RBI",
     "MONEYLINE EDGE",
     "📥 SEASON DATA",
     "🟣 FS UD WATCHER",
