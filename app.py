@@ -24444,6 +24444,290 @@ def render_v3_batter_research_tab(market="FS"):
             else:
                 st.error("🔴 PASS / THIN — " + verdict_text)
 
+
+
+# =========================
+# V3 BATTER BOARD-ONLY PATCH — FS/HRR FILTERED TO UNDERDOG POSTED PLAYERS
+# =========================
+# Version: V3_BATTER_BOARD_ONLY_FS_HRR_2026_06_16
+# Purpose:
+# - Show Batter FS and H+R+RBI only for players with active Underdog posted lines.
+# - Use Opening Day batter logs for true projection/research.
+# - Keep manual override optional, defaulting to the Underdog line.
+# - Does NOT touch Pitcher K, Pitcher FS, IP, Moneyline, or official K decisions.
+V3_BATTER_BOARD_ONLY_PATCH_VERSION = "V3_BATTER_BOARD_ONLY_FS_HRR_2026_06_16"
+
+@st.cache_data(ttl=120, show_spinner=False)
+def _v3_board_only_ud_rows_cached(market="FS"):
+    """Return Underdog rows for Batter FS or H+R+RBI.
+    This wrapper keeps the app fast and isolates Underdog parsing from tab rendering.
+    """
+    m = str(market or "FS").upper()
+    try:
+        if m == "FS":
+            rows = _v3_fetch_ud_batter_fs_rows() or []
+        else:
+            rows = _v3_ud_hrr_rows() or []
+    except Exception as e:
+        return [], f"Underdog parser error: {e}"
+    clean=[]
+    for r in rows:
+        player = str(r.get("Player") or "").strip()
+        line = _v3_safe_num(r.get("Line"), None)
+        if player and line is not None:
+            clean.append({
+                "Source": r.get("Source", "Underdog"),
+                "Player": player,
+                "Market": "Batter FS" if m == "FS" else "H+R+RBI",
+                "Line": float(line),
+                "Evidence": str(r.get("Evidence", ""))[:350],
+            })
+    # Deduplicate by player+market, keep the first valid posted line.
+    dedup = {}
+    for r in clean:
+        key = (_v3_norm_name(r.get("Player")), r.get("Market"))
+        dedup.setdefault(key, r)
+    return list(dedup.values()), "OK"
+
+def _v3_best_batter_log_match(ud_player, grouped_items):
+    """Match an Underdog player display name to a full-name batter log group.
+    Handles S. Ohtani -> Shohei Ohtani, B. Witt -> Bobby Witt Jr., etc.
+    """
+    best_key, best_name, best_score = None, "", 0.0
+    ud = str(ud_player or "")
+    for norm, d in grouped_items:
+        try:
+            pcol = _v3_col(d, ["Player", "Batter", "Name"])
+            full = str(d[pcol].dropna().astype(str).iloc[-1]) if pcol and not d.empty else str(norm)
+        except Exception:
+            full = str(norm)
+        try:
+            sc = name_score(ud, full)
+        except Exception:
+            sc = 1.0 if _v3_norm_name(ud) == _v3_norm_name(full) else 0.0
+        # Bonus if last names line up exactly after normalization.
+        up, fp = _v3_norm_name(ud).split(), _v3_norm_name(full).split()
+        if up and fp and up[-1] == fp[-1]:
+            sc = max(sc, 0.86)
+            if len(up[0]) == 1 and fp[0].startswith(up[0]):
+                sc = max(sc, 0.93)
+        if sc > best_score:
+            best_key, best_name, best_score = norm, full, sc
+    return best_key, best_name, best_score
+
+def build_v3_batter_research_table(market="FS"):
+    """Board-only Batter FS / H+R+RBI table.
+    Pulls Underdog posted players first, then matches only those players to Opening Day logs.
+    """
+    stat_col = "FS" if str(market).upper() == "FS" else "HRR"
+    market_label = "Batter FS" if stat_col == "FS" else "H+R+RBI"
+    ud_rows, status = _v3_board_only_ud_rows_cached(stat_col)
+    if not ud_rows:
+        return pd.DataFrame(), {"status": status, "ud_rows": 0, "matched": 0, "missing": []}
+
+    logs = _v3_batter_logs_df()
+    if not isinstance(logs, pd.DataFrame) or logs.empty:
+        return pd.DataFrame(), {"status": "No batter logs loaded", "ud_rows": len(ud_rows), "matched": 0, "missing": [r.get("Player") for r in ud_rows[:25]]}
+    pcol = _v3_col(logs, ["Player", "Batter", "Name"])
+    if not pcol or stat_col not in logs.columns:
+        return pd.DataFrame(), {"status": f"Missing Player or {stat_col} column in batter logs", "ud_rows": len(ud_rows), "matched": 0, "missing": []}
+
+    d0 = logs.copy()
+    date_col = _v3_col(d0, ["Date", "Game Date", "game_date"])
+    if date_col:
+        d0["_v3_date"] = pd.to_datetime(d0[date_col], errors="coerce")
+        d0 = d0.sort_values("_v3_date")
+    d0["_v3_player_norm"] = d0[pcol].map(_v3_norm_name)
+    grouped = list(d0.groupby("_v3_player_norm", sort=False))
+    sched = _v3_team_schedule_context_map()
+    out=[]
+    missing=[]
+    for ud in ud_rows:
+        ud_player = ud.get("Player")
+        line = _v3_safe_num(ud.get("Line"), None)
+        if not ud_player or line is None:
+            continue
+        match_key, full_name, match_sc = _v3_best_batter_log_match(ud_player, grouped)
+        if match_key is None or match_sc < 0.78:
+            missing.append(f"{ud_player} ({match_sc:.2f})")
+            continue
+        d = d0[d0["_v3_player_norm"] == match_key].copy()
+        if d.empty:
+            missing.append(str(ud_player))
+            continue
+        tcol = _v3_col(d, ["Team", "team", "Tm"])
+        team = _v3_latest_team_for_player(d)
+        ctx = sched.get(str(team).upper(), {}) if team else {}
+        vals = _v3_last_values(d, stat_col, 1000)
+        proj = _v3_weighted_projection(vals)
+        if proj is None:
+            missing.append(str(ud_player))
+            continue
+        l5 = _v3_last_values(d, stat_col, 5)
+        l10 = _v3_last_values(d, stat_col, 10)
+        l15 = _v3_last_values(d, stat_col, 15)
+        avg, med = _v3_avg_med(l10 if l10 else vals)
+        edge = round(float(proj) - float(line), 2)
+        pick = "OVER" if edge > 0 else "UNDER" if edge < 0 else "PASS"
+        loc = _v3_location_summary_with_current_context(d, stat_col, line, pick if pick != "PASS" else "OVER", ctx.get("Home/Away"))
+        h2h = _v3_h2h_summary(d, stat_col, line, pick if pick != "PASS" else "OVER")
+        l5_rate, l5_pct = _v3_hit_rate(l5, line, pick if pick != "PASS" else "OVER")
+        l10_rate, l10_pct = _v3_hit_rate(l10, line, pick if pick != "PASS" else "OVER")
+        l15_rate, l15_pct = _v3_hit_rate(l15, line, pick if pick != "PASS" else "OVER")
+        same_rate, same_pct = _v3_hit_rate(vals, line, pick if pick != "PASS" else "OVER")
+
+        score = 45
+        # Projection edge is king, with market scale awareness.
+        if stat_col == "FS":
+            score += clamp(abs(edge) * 8.0, 0, 28)
+        else:
+            score += clamp(abs(edge) * 18.0, 0, 28)
+        for pct, wt in [(l5_pct, 9), (l10_pct, 10), (l15_pct, 7), (same_pct, 6)]:
+            if pct is None:
+                continue
+            score += (pct - 0.50) * wt if pick == "OVER" else (0.50 - pct) * wt
+        if len(vals) >= 20:
+            score += 6
+        elif len(vals) >= 10:
+            score += 3
+        if ctx.get("Matchup"):
+            score += 3
+        score = int(round(clamp(score, 0, 100)))
+        if score >= 78:
+            label = "STRONG AGREEMENT"
+        elif score >= 65:
+            label = "GOOD AGREEMENT"
+        elif score >= 52:
+            label = "MIXED"
+        else:
+            label = "AGAINST TREND"
+        conf = _v3_manual_confidence(proj, line, score, stat_col)
+        out.append({
+            "Player": full_name,
+            "UD Player": ud_player,
+            "Match Score": round(float(match_sc), 3),
+            "Team": team or "—",
+            "Opponent": ctx.get("Opponent", "—"),
+            "Matchup": ctx.get("Matchup", "—"),
+            "Home/Away Today": ctx.get("Home/Away", "—"),
+            "Market": market_label,
+            "Pick": pick,
+            "Line": float(line),
+            "Projection": round(float(proj), 2),
+            "Edge": edge,
+            "Confidence": conf,
+            "Last 5": l5_rate,
+            "Last 10": l10_rate,
+            "Last 15": l15_rate,
+            "Same-Line": same_rate,
+            "Last 5 Avg": None if not l5 else round(float(np.mean(l5)), 2),
+            "Last 10 Avg": None if not l10 else round(float(np.mean(l10)), 2),
+            "Last 15 Avg": None if not l15 else round(float(np.mean(l15)), 2),
+            "Average": None if avg is None else round(avg, 2),
+            "Median": None if med is None else round(med, 2),
+            "Home/Away": loc.get("label"),
+            "H2H": h2h.get("label"),
+            "Line Sensitivity": _v3_manual_line_sensitivity(proj, stat_col),
+            "Sync Score": score,
+            "Sync Label": label,
+            "Recent Values": l10,
+            "Source": "Underdog posted line + Opening Day logs",
+            "Evidence": str(ud.get("Evidence", ""))[:350],
+            "Official Play Filter": "RESEARCH ONLY — BOARD LINE",
+            "Confirmed Lineup Status": "VERIFY LINEUP / PROJECTED CONTEXT",
+            "Matchup Summary": f"{full_name} {market_label}: projection {round(float(proj),2)} vs Underdog line {float(line):g} ({pick}, edge {edge:+.2f}). Context: {ctx.get('Matchup','schedule not matched')}. Name match {match_sc:.2f} from {ud_player}.",
+            "Research Version": V3_BATTER_BOARD_ONLY_PATCH_VERSION,
+        })
+    meta = {"status": status, "ud_rows": len(ud_rows), "matched": len(out), "missing": missing[:30]}
+    if not out:
+        return pd.DataFrame(), meta
+    return pd.DataFrame(out).sort_values(["Sync Score", "Edge"], ascending=[False, False], na_position="last"), meta
+
+def render_v3_batter_research_tab(market="FS"):
+    stat_col = "FS" if str(market).upper() == "FS" else "HRR"
+    title = "Batter FS Research" if stat_col == "FS" else "H+R+RBI Research"
+    st.markdown(f'<div class="section-title-pro">🧪 {title} — Underdog Board Only</div>', unsafe_allow_html=True)
+    st.caption("Only players with active Underdog posted lines are shown. Projections still use Opening Day batter logs + matchup context. Pitcher K engine is untouched.")
+    result = build_v3_batter_research_table(market)
+    if isinstance(result, tuple):
+        df, meta = result
+    else:
+        df, meta = result, {}
+    if not isinstance(df, pd.DataFrame) or df.empty:
+        st.warning("No active Underdog posted players matched to loaded batter logs for this market.")
+        with st.expander("Debug / why empty", expanded=True):
+            st.write(meta)
+            st.write("Expected batter log columns:", ["Date","Player","Team","Opponent","Home/Away","Lineup Slot","PA","AB","H","R","RBI","Fantasy Score"])
+        return
+    c1,c2,c3,c4 = st.columns(4)
+    c1.metric("UD Lines", meta.get("ud_rows", len(df)))
+    c2.metric("Matched", len(df))
+    c3.metric("Strong", int((pd.to_numeric(df.get("Sync Score"), errors="coerce") >= 75).sum()))
+    c4.metric("Mode", "UD Board")
+    cols=[c for c in ["Player","UD Player","Team","Opponent","Matchup","Home/Away Today","Market","Pick","Line","Projection","Edge","Confidence","Last 5","Last 10","Last 15","Same-Line","Average","Median","Home/Away","H2H","Sync Score","Sync Label"] if c in df.columns]
+    st.dataframe(df[cols], use_container_width=True, hide_index=True)
+
+    names = df["Player"].dropna().astype(str).tolist()
+    selected = st.selectbox(f"Open {title} card", names, key=_v3_unique_widget_key(f"v3_batter_board_select_{market}"))
+    rr = df[df["Player"].astype(str)==selected].iloc[0].to_dict()
+    posted_line = _v3_safe_num(rr.get("Line"), 0.0) or 0.0
+    line_used = st.number_input(
+        f"Line for {selected} (defaults to Underdog posted line)",
+        min_value=0.0,
+        max_value=99.5,
+        value=float(posted_line),
+        step=0.5,
+        key=_v3_unique_widget_key(f"v3_board_line_override_{market}_{_v3_norm_name(selected)}"),
+        help="Defaults to the pulled Underdog line. You can override only if the posted line moved. Projection is not changed."
+    )
+    proj = _v3_safe_num(rr.get("Projection"), None)
+    has_line = line_used is not None and float(line_used) > 0 and proj is not None
+    if has_line:
+        edge = round(float(proj) - float(line_used), 2)
+        lean = "OVER" if edge > 0 else "UNDER" if edge < 0 else "PASS"
+        conf = _v3_manual_confidence(proj, line_used, rr.get("Sync Score"), stat_col)
+        l5_rate, _, _ = _v3_batter_rate_against_manual_line(selected, stat_col, line_used, lean, 5)
+        l10_rate, _, _ = _v3_batter_rate_against_manual_line(selected, stat_col, line_used, lean, 10)
+        l15_rate, _, _ = _v3_batter_rate_against_manual_line(selected, stat_col, line_used, lean, 15)
+        same_rate, _, _ = _v3_batter_rate_against_manual_line(selected, stat_col, line_used, lean, None)
+    else:
+        edge, lean, conf = None, "PROJECTION ONLY", None
+        l5_rate = l10_rate = l15_rate = same_rate = "—"
+    with st.expander(f"{selected} — {title} Outlier-Style Card", expanded=True):
+        a,b,c,d,e,f = st.columns(6)
+        a.metric("Projection", rr.get("Projection","—"))
+        b.metric("Line", line_used if has_line else "—")
+        c.metric("Edge", f"{edge:+.2f}" if edge is not None else "—")
+        d.metric("Lean", lean)
+        e.metric("Confidence", f"{conf}/10" if conf is not None else "—")
+        f.metric("Sync", f"{rr.get('Sync Score')}%")
+        st.markdown("**Last 10 Results**", unsafe_allow_html=True)
+        st.markdown(_v3_bar_html_vals(rr.get("Recent Values") or [], line_used if has_line else rr.get("Projection"), "OVER" if not has_line else lean), unsafe_allow_html=True)
+        st.markdown("### Matchup Summary")
+        st.info(rr.get("Matchup Summary", "—"))
+        st.markdown("### Hit Rate")
+        st.write({"Last 5": l5_rate, "Last 10": l10_rate, "Last 15": l15_rate, "Same/All Loaded": same_rate, "Average": rr.get("Average"), "Median": rr.get("Median"), "Home/Away": rr.get("Home/Away"), "H2H": rr.get("H2H")})
+        good, bad = _v3_manual_batter_good_bad(rr, line_used if has_line else None, lean, edge or 0, stat_col)
+        st.markdown("### The Good")
+        for g in good:
+            st.markdown(f"✅ {g}")
+        st.markdown("### The Bad")
+        for btxt in bad:
+            st.markdown(f"❌ {btxt}" if "No major" not in btxt else f"⚠️ {btxt}")
+        st.markdown("### Line Sensitivity")
+        st.info(_v3_manual_line_sensitivity(proj, stat_col))
+        st.markdown("### Outlier-Style Verdict")
+        if not has_line:
+            st.warning(f"Projection-only mode: {rr.get('Market')} projection {rr.get('Projection')} | {rr.get('Matchup','—')} | Sync {rr.get('Sync Score')}%")
+        else:
+            verdict_text = f"{lean} {line_used:g} | Projection {proj:g} | Edge {edge:+.2f} | Confidence {conf}/10 | Sync {rr.get('Sync Score')}% ({rr.get('Sync Label')})"
+            if conf is not None and conf >= 8 and abs(edge) >= (2.0 if stat_col == "FS" else 0.75):
+                st.success("🟢 " + verdict_text)
+            elif conf is not None and conf >= 6.5:
+                st.warning("🟡 " + verdict_text)
+            else:
+                st.error("🔴 PASS / THIN — " + verdict_text)
+
 tab_kproj, tab_pitcher_fs, tab_research_hub, tab_batter_fs, tab_hrr, tab_moneyline, tab_iq, tab_calibration, tab2, tab3, tab4, tab5, tab6 = st.tabs([
     "1️⃣ PITCHER K",
     "2️⃣ PITCHER FS",
