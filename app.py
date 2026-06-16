@@ -23827,6 +23827,389 @@ def render_v3_batter_research_tab(market="FS"):
         else:
             st.warning(f"{verdict}: {rr.get('Pick')} lean | Projection {rr.get('Projection')} vs Line {rr.get('Line')} | Sync {rr.get('Sync Score')}% ({rr.get('Sync Label')})")
 
+
+
+# =========================
+# V3 BATTER FS / HRR LINE MATCH FIX + PROJECTION CONSISTENCY GUARD
+# Version: V3_BATTER_UNDERDOG_MATCH_FIX_2026_06_16
+# Scope:
+# - Batter FS + H+R+RBI research line matching only.
+# - Adds robust Underdog relationship parsing + abbreviated-name matching.
+# - Does NOT change pitcher K projection math, pitcher FS math, Batter FS projection formula,
+#   HRR projection formula, IP math, or decisions. It only fixes posted-line matching/display.
+# =========================
+V3_BATTER_UD_MATCH_FIX_VERSION = "V3_BATTER_UNDERDOG_MATCH_FIX_2026_06_16"
+
+
+def _v3_name_tokens_for_match(name):
+    s = _v3_norm_name(name)
+    parts = [p for p in s.replace('.', ' ').split() if p]
+    suffixes = {'jr','sr','ii','iii','iv'}
+    parts = [p for p in parts if p not in suffixes]
+    return parts
+
+
+def _v3_name_match_score(a, b):
+    """Name match that handles Underdog abbreviations like S. Ohtani / B. Witt."""
+    try:
+        base = name_score(a, b)
+    except Exception:
+        import difflib
+        base = difflib.SequenceMatcher(None, _v3_norm_name(a), _v3_norm_name(b)).ratio()
+    ap = _v3_name_tokens_for_match(a)
+    bp = _v3_name_tokens_for_match(b)
+    if not ap or not bp:
+        return base
+    # Exact full normalized name.
+    if ' '.join(ap) == ' '.join(bp):
+        return 1.0
+    # First-initial + last-name match.
+    if ap[-1] == bp[-1] and ap[0][:1] == bp[0][:1]:
+        return max(base, 0.965)
+    # Allow middle names/two-part display if final token and initial agree.
+    if ap[-1] == bp[-1] and ap[0][:1] == bp[0][:1]:
+        return max(base, 0.94)
+    # Last-name exact + strong fuzzy full-name.
+    if ap[-1] == bp[-1] and base >= 0.72:
+        return max(base, 0.86)
+    return base
+
+
+def _v3_player_batter_logs(player):
+    """Robust batter-log lookup. Exact first, then abbreviation/fuzzy fallback.
+
+    This fixes Underdog names like "S. Ohtani" matching logs like "Shohei Ohtani".
+    """
+    df = _v3_batter_logs_df()
+    if df.empty:
+        return df
+    pcol = _v3_col(df, ["Player", "Batter", "Name"])
+    if not pcol:
+        return pd.DataFrame()
+    d = df.copy()
+    d["_v3_player_norm"] = d[pcol].map(_v3_norm_name)
+    target_norm = _v3_norm_name(player)
+    exact = d[d["_v3_player_norm"] == target_norm].copy()
+    if not exact.empty:
+        hit = exact
+    else:
+        # Match against unique names by score, then filter all rows for best name.
+        names = d[pcol].dropna().astype(str).unique().tolist()
+        best_name, best_score = "", 0.0
+        for nm in names:
+            sc = _v3_name_match_score(player, nm)
+            if sc > best_score:
+                best_name, best_score = nm, sc
+        if best_name and best_score >= 0.86:
+            hit = d[d[pcol].astype(str) == str(best_name)].copy()
+            try:
+                hit["_v3_match_note"] = f"matched UD '{player}' to logs '{best_name}' ({best_score:.2f})"
+            except Exception:
+                pass
+        else:
+            return pd.DataFrame()
+    date_col = _v3_col(hit, ["Date", "Game Date", "game_date"])
+    if date_col:
+        hit["_v3_date"] = pd.to_datetime(hit[date_col], errors="coerce")
+        hit = hit.sort_values("_v3_date")
+    return hit
+
+
+def _v3_attrs(obj):
+    if not isinstance(obj, dict):
+        return {}
+    out = {}
+    a = obj.get('attributes')
+    if isinstance(a, dict):
+        out.update(a)
+    for k, v in obj.items():
+        if k not in ['attributes', 'relationships', 'included', 'data'] and k not in out:
+            out[k] = v
+    return out
+
+
+def _v3_collect_json_objects(data):
+    out = []
+    def walk(x, parent_key=''):
+        if isinstance(x, dict):
+            y = dict(x)
+            if parent_key and '_parent_key' not in y:
+                y['_parent_key'] = parent_key
+            out.append(y)
+            for k, v in x.items():
+                if isinstance(v, (dict, list)):
+                    walk(v, k)
+        elif isinstance(x, list):
+            for z in x:
+                walk(z, parent_key)
+    walk(data)
+    return out
+
+
+def _v3_obj_type(obj):
+    if not isinstance(obj, dict):
+        return ''
+    return str(obj.get('type') or obj.get('_parent_key') or '').lower().replace('-', '_')
+
+
+def _v3_obj_id(obj):
+    if not isinstance(obj, dict):
+        return None
+    v = obj.get('id') or _v3_attrs(obj).get('id')
+    return str(v) if v not in [None, ''] else None
+
+
+def _v3_build_obj_maps(objects):
+    by_key, by_id = {}, {}
+    for o in objects or []:
+        oid = _v3_obj_id(o)
+        if not oid:
+            continue
+        typ = _v3_obj_type(o)
+        for tt in {typ, typ.rstrip('s'), typ+'s'}:
+            by_key[(tt, oid)] = o
+        by_id.setdefault(oid, []).append(o)
+    return by_key, by_id
+
+
+def _v3_rel_obj(obj, names, by_key, by_id):
+    if not isinstance(obj, dict):
+        return None
+    rels = obj.get('relationships') or {}
+    for name in names:
+        keys = {name, name.replace('_','-'), name.replace('_',''), name.rstrip('s'), name+'s'}
+        for key in keys:
+            node = rels.get(key)
+            if node is None:
+                continue
+            data = node.get('data') if isinstance(node, dict) else node
+            items = data if isinstance(data, list) else [data]
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                ri = item.get('id')
+                rt = str(item.get('type') or key or '').lower().replace('-', '_')
+                if ri in [None, '']:
+                    continue
+                for cand_t in [rt, rt.rstrip('s'), rt+'s', key, key.rstrip('s'), key+'s']:
+                    hit = by_key.get((cand_t, str(ri)))
+                    if hit is not None:
+                        return hit
+                candidates = by_id.get(str(ri), [])
+                if candidates:
+                    for c in candidates:
+                        ct = _v3_obj_type(c)
+                        if key.rstrip('s') in ct or ct.rstrip('s') in key:
+                            return c
+                    return candidates[0]
+    return None
+
+
+def _v3_text_from(*objs):
+    parts = []
+    wanted = [
+        'title','display_title','name','player_name','full_name','first_name','last_name',
+        'display_name','stat','stat_type','appearance_stat','display_stat','label','market',
+        'market_name','sport','league','sport_name','league_name','description','appearance_name',
+        'over_under','over_under_title','scoring_type','projection_type','stat_value','line_score','position'
+    ]
+    for obj in objs:
+        if not isinstance(obj, dict):
+            continue
+        for dct in [_v3_attrs(obj), obj]:
+            if not isinstance(dct, dict):
+                continue
+            for k in wanted:
+                v = dct.get(k)
+                if isinstance(v, dict):
+                    for kk in wanted:
+                        vv = v.get(kk)
+                        if vv not in [None, ''] and not isinstance(vv, (dict, list)):
+                            parts.append(str(vv))
+                elif v not in [None, ''] and not isinstance(v, (dict, list)):
+                    parts.append(str(v))
+    return ' | '.join(parts)
+
+
+def _v3_structured_line(*objs, min_line=0.5, max_line=40.0):
+    keys = ['stat_value','line','over_under_line','target_value','line_score','overUnderLine','display_stat_value','points']
+    for obj in objs:
+        if not isinstance(obj, dict):
+            continue
+        for dct in [_v3_attrs(obj), obj]:
+            if not isinstance(dct, dict):
+                continue
+            for k in keys:
+                v = _v3_safe_num(dct.get(k), None)
+                if v is not None and min_line <= v <= max_line and abs(v*2 - round(v*2)) < 1e-9:
+                    return float(v)
+    return None
+
+
+def _v3_clean_ud_player_from(*objs):
+    candidates = []
+    for obj in objs:
+        if not isinstance(obj, dict):
+            continue
+        a = _v3_attrs(obj)
+        first_last = (str(a.get('first_name','')).strip() + ' ' + str(a.get('last_name','')).strip()).strip()
+        for k in ['display_name','full_name','name','player_name','title','description','appearance_name']:
+            v = a.get(k)
+            if isinstance(v, str):
+                candidates.append(v)
+        if first_last.strip():
+            candidates.append(first_last)
+    cleaned = []
+    import re
+    for c in candidates:
+        cc = str(c or '').strip()
+        # Remove market tails if title includes them.
+        cc = re.sub(r'\s+(Fantasy\s+(Score|Points)|Hits\s*\+\s*Runs\s*\+\s*RBIs?|H\s*\+\s*R\s*\+\s*R).*$', '', cc, flags=re.I).strip()
+        if cc and len(_v3_norm_name(cc).split()) >= 2 and len(cc) <= 70:
+            if not re.search(r'\b(Over|Under|Line|Total|Bases|Fantasy|Hits|Runs|RBIs?|Pitcher|Strikeouts)\b', cc, re.I):
+                cleaned.append(cc)
+    if cleaned:
+        return sorted(set(cleaned), key=lambda x: (len(x.split()), len(x)), reverse=True)[0]
+    return ''
+
+
+def _v3_fetch_ud_batter_fs_rows():
+    """Robust Underdog Batter Fantasy Score parser.
+
+    Supports relationship path line -> over_under -> appearance -> player and abbreviated names.
+    Returns only posted MLB Batter FS lines. If Underdog does not post FS, returns empty.
+    """
+    import re
+    rows = []
+    debug = {'urls': 0, 'objects': 0, 'line_candidates': 0, 'fs_market_hits': 0, 'matched_to_logs': 0, 'sample_markets': []}
+
+    # First use any already-loaded UD board dataframe, because that mirrors what K Upside sees.
+    try:
+        raw = _fsud_raw_df() if callable(globals().get('_fsud_raw_df')) else pd.DataFrame()
+        if isinstance(raw, pd.DataFrame) and not raw.empty:
+            for _, rr in raw.iterrows():
+                row = rr.to_dict()
+                prop_txt = _fsud_prop_text(row) if callable(globals().get('_fsud_prop_text')) else str(row)
+                if not (_fsud_is_fantasy_points(prop_txt) if callable(globals().get('_fsud_is_fantasy_points')) else ('fantasy' in str(prop_txt).lower())):
+                    continue
+                player = _fsud_player(row) if callable(globals().get('_fsud_player')) else str(row.get('Player') or row.get('Name') or '')
+                line = _fsud_line(row) if callable(globals().get('_fsud_line')) else _v3_safe_num(row.get('Line'), None)
+                if player and line is not None:
+                    rows.append({'Source':'Underdog', 'Player':player, 'Market':'Batter FS', 'Line':float(line), 'Evidence':str(prop_txt)[:260]})
+    except Exception:
+        pass
+
+    fs_terms = ['fantasy points', 'fantasy score', 'fantasy']
+    hard_bad = re.compile(r'Pitcher\s+Fantasy|Pitching|Strikeouts|Shots|Goals|Assists|Saves|Blocks|Tackles|Soccer|NHL|NBA|NFL|Golf|Tennis|Hockey|Basketball|Football', re.I)
+    fs_title_re = re.compile(r"([A-Z][A-Za-zÀ-ÿ.'’\-]+(?:\s+(?:[A-Z][A-Za-zÀ-ÿ.'’\-]+|Jr\.?|Sr\.?|II|III|IV)){0,5})\s+Fantasy\s+(?:Score|Points)", re.I)
+
+    for url in UNDERDOG_URLS:
+        data = safe_get_json(url, timeout=18)
+        if not data:
+            continue
+        debug['urls'] += 1
+        objects = _v3_collect_json_objects(data)
+        debug['objects'] += len(objects)
+        by_key, by_id = _v3_build_obj_maps(objects)
+        line_candidates = []
+        for o in objects:
+            a = _v3_attrs(o)
+            t = _v3_obj_type(o)
+            if 'over_under_line' in t or any(a.get(k) not in [None, ''] for k in ['stat_value','line_score','over_under_line','target_value','line','points']):
+                line_candidates.append(o)
+        debug['line_candidates'] += len(line_candidates)
+
+        for line_obj in line_candidates:
+            ou_obj = _v3_rel_obj(line_obj, ['over_under','over_unders'], by_key, by_id)
+            app_obj = _v3_rel_obj(ou_obj, ['appearance','appearances'], by_key, by_id) or _v3_rel_obj(line_obj, ['appearance','appearances'], by_key, by_id)
+            player_obj = _v3_rel_obj(app_obj, ['player','players'], by_key, by_id) or _v3_rel_obj(ou_obj, ['player','players'], by_key, by_id) or _v3_rel_obj(line_obj, ['player','players'], by_key, by_id)
+            blob = _v3_text_from(line_obj, ou_obj, app_obj, player_obj)
+            low = blob.lower()
+            if len(debug['sample_markets']) < 8 and 'fantasy' in low:
+                debug['sample_markets'].append(blob[:180])
+            if not any(t in low for t in fs_terms):
+                continue
+            if hard_bad.search(blob):
+                continue
+            line = _v3_structured_line(line_obj, ou_obj, app_obj, min_line=3.5, max_line=30.5)
+            if line is None:
+                continue
+            player = _v3_clean_ud_player_from(player_obj, app_obj, ou_obj, line_obj)
+            if not player:
+                m = fs_title_re.search(blob or '')
+                if m:
+                    player = m.group(1).strip()
+            if not player:
+                continue
+            debug['fs_market_hits'] += 1
+            # Do not require MLB lookup here; instead require a batter-log match. This supports S. Ohtani abbreviations.
+            if _v3_player_batter_logs(player).empty:
+                continue
+            debug['matched_to_logs'] += 1
+            rows.append({'Source':'Underdog', 'Player':player.strip(), 'Market':'Batter FS', 'Line':float(line), 'Evidence':blob[:260]})
+
+    dedup = {}
+    for r in rows:
+        # Dedup by best log-matched normalized key if available.
+        key_name = _v3_norm_name(r.get('Player'))
+        try:
+            logs = _v3_player_batter_logs(r.get('Player'))
+            pcol = _v3_col(logs, ['Player','Batter','Name'])
+            if pcol and not logs.empty:
+                key_name = _v3_norm_name(logs[pcol].dropna().astype(str).iloc[-1])
+                r['Player'] = logs[pcol].dropna().astype(str).iloc[-1]
+        except Exception:
+            pass
+        dedup[(key_name, 'Batter FS')] = r
+    try:
+        st.session_state['v3_batter_fs_ud_debug'] = debug
+    except Exception:
+        pass
+    return list(dedup.values())
+
+
+def _v3_ud_hrr_rows():
+    """HRR rows with the same batter-log name normalization as Batter FS."""
+    rows = []
+    try:
+        fn = globals().get('fetch_underdog_batter_prop_rows')
+        raw = fn() if callable(fn) else []
+        for r in raw or []:
+            market_txt = str(r.get('Market','')) + ' ' + str(r.get('Market Label',''))
+            if str(r.get('Market','')).upper() == 'HRR' or 'H+R+R' in market_txt or 'H + R + R' in market_txt or 'Hits' in market_txt and 'RBI' in market_txt:
+                player = r.get('Player')
+                line = _v3_safe_num(r.get('Line'), None)
+                if not player or line is None:
+                    continue
+                logs = _v3_player_batter_logs(player)
+                if logs.empty:
+                    continue
+                pcol = _v3_col(logs, ['Player','Batter','Name'])
+                if pcol and not logs.empty:
+                    player = logs[pcol].dropna().astype(str).iloc[-1]
+                rows.append({'Source':r.get('Source','Underdog'), 'Player':player, 'Market':'H+R+RBI', 'Line':line, 'Evidence':r.get('Evidence','')})
+    except Exception:
+        pass
+    dedup = {}
+    for r in rows:
+        dedup[(_v3_norm_name(r.get('Player')), 'HRR')] = r
+    return list(dedup.values())
+
+
+def _v3_batter_research_debug_box(market):
+    """Small debug display to explain empty tabs without crashing."""
+    try:
+        if str(market).upper() == 'FS':
+            dbg = st.session_state.get('v3_batter_fs_ud_debug', {})
+        else:
+            dbg = st.session_state.get('hrr_ud_debug', {})
+        if dbg:
+            with st.expander(f'{market} Underdog match debug'):
+                st.write(dbg)
+    except Exception:
+        pass
+
+
 tab_kproj, tab_pitcher_fs, tab_research_hub, tab_batter_fs, tab_hrr, tab_moneyline, tab_mlb30_puller, tab_fs_ud_watcher, tab_iq, tab_30d_learning, tab_learning_lab, tab_calibration, tab2, tab3, tab4, tab5, tab6 = st.tabs([
     "1️⃣ PITCHER K",
     "2️⃣ PITCHER FS",
