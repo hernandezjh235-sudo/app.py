@@ -24915,7 +24915,7 @@ def render_v3_batter_research_tab(market="FS"):
     stat_col = "FS" if str(market).upper() == "FS" else "HRR"
     title = "Batter FS Research" if stat_col == "FS" else "H+R+RBI Research"
     st.markdown(f'<div class="section-title-pro">🧪 {title} — Underdog Board Only</div>', unsafe_allow_html=True)
-    st.caption("Only players with active Underdog posted lines are shown. Projections still use Opening Day batter logs + matchup context. Pitcher K engine is untouched.")
+    st.caption("Only players with active Underdog posted lines are shown. The pulled line is used by default; override is hidden under Advanced. Projections still use Opening Day batter logs + matchup context. Pitcher K engine is untouched.")
     result = build_v3_batter_research_table(market)
     if isinstance(result, tuple):
         df, meta = result
@@ -24939,15 +24939,18 @@ def render_v3_batter_research_tab(market="FS"):
     selected = st.selectbox(f"Open {title} card", names, key=_v3_unique_widget_key(f"v3_batter_board_select_{market}"))
     rr = df[df["Player"].astype(str)==selected].iloc[0].to_dict()
     posted_line = _v3_safe_num(rr.get("Line"), 0.0) or 0.0
-    line_used = st.number_input(
-        f"Line for {selected} (defaults to Underdog posted line)",
-        min_value=0.0,
-        max_value=99.5,
-        value=float(posted_line),
-        step=0.5,
-        key=_v3_unique_widget_key(f"v3_board_line_override_{market}_{_v3_norm_name(selected)}"),
-        help="Defaults to the pulled Underdog line. You can override only if the posted line moved. Projection is not changed."
-    )
+    line_used = float(posted_line)
+    # Default view uses the pulled Underdog posted line. Keep manual override hidden so the card is cleaner.
+    with st.expander("Advanced: override line if it moved", expanded=False):
+        line_used = st.number_input(
+            f"Override line for {selected}",
+            min_value=0.0,
+            max_value=99.5,
+            value=float(posted_line),
+            step=0.5,
+            key=_v3_unique_widget_key(f"v3_board_line_override_{market}_{_v3_norm_name(selected)}"),
+            help="Defaults to the pulled Underdog line. Use only if the posted line moved. Projection is not changed."
+        )
     proj = _v3_safe_num(rr.get("Projection"), None)
     has_line = line_used is not None and float(line_used) > 0 and proj is not None
     if has_line:
@@ -24964,7 +24967,7 @@ def render_v3_batter_research_tab(market="FS"):
     with st.expander(f"{selected} — {title} Outlier-Style Card", expanded=True):
         a,b,c,d,e,f = st.columns(6)
         a.metric("Projection", rr.get("Projection","—"))
-        b.metric("Line", line_used if has_line else "—")
+        b.metric("Underdog Line", line_used if has_line else "—")
         c.metric("Edge", f"{edge:+.2f}" if edge is not None else "—")
         d.metric("Lean", lean)
         e.metric("Confidence", f"{conf}/10" if conf is not None else "—")
