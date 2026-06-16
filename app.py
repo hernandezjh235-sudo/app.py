@@ -24722,6 +24722,215 @@ def _v3_ud_hrr_rows():
         pass
     return out
 
+
+# =========================
+# V3 TAB STABILITY + BATTER LINE MATCHING FIX
+# Version: V3_TAB_STABILITY_FS_HRR_MATCH_2026_06_16
+# Scope: UI/data matching only. Does NOT change pitcher K, IP, batter projection formulas, or decisions.
+# =========================
+V3_TAB_STABILITY_FS_HRR_MATCH_VERSION = "V3_TAB_STABILITY_FS_HRR_MATCH_2026_06_16"
+
+def _v3_log_name_candidates_df():
+    """Return batter logs with a normalized player column for fast name matching."""
+    try:
+        df = _v3_batter_logs_df()
+        if not isinstance(df, pd.DataFrame) or df.empty:
+            return pd.DataFrame(), None
+        pcol = _v3_col(df, ["Player", "Batter", "Name", "player", "batter_name"])
+        if not pcol:
+            return pd.DataFrame(), None
+        d = df.copy()
+        d["_v3_player_norm"] = d[pcol].map(_v3_norm_name)
+        return d, pcol
+    except Exception:
+        return pd.DataFrame(), None
+
+def _v3_name_initial_last_parts(name):
+    """Normalize full and abbreviated names like S. Ohtani / B. Witt / P. Crow-Armstrong."""
+    n = _v3_norm_name(name)
+    parts = [p for p in str(n).split() if p]
+    if not parts:
+        return "", ""
+    first_initial = parts[0][0] if parts[0] else ""
+    last = parts[-1]
+    # remove suffixes for matching
+    if last in {"jr", "sr", "ii", "iii", "iv"} and len(parts) >= 2:
+        last = parts[-2]
+    return first_initial, last
+
+def _v3_best_batter_log_name_match(player):
+    """Map Underdog names to the exact name in batter logs.
+    Supports:
+    - S. Ohtani -> Shohei Ohtani
+    - B. Witt -> Bobby Witt Jr.
+    - P. Crow-Armstrong -> Pete Crow-Armstrong
+    """
+    try:
+        d, pcol = _v3_log_name_candidates_df()
+        if d.empty or not pcol:
+            return str(player or "")
+        target_norm = _v3_norm_name(player)
+        if not target_norm:
+            return str(player or "")
+
+        # Exact normalized match.
+        exact = d[d["_v3_player_norm"] == target_norm]
+        if not exact.empty:
+            return str(exact[pcol].dropna().astype(str).iloc[-1])
+
+        ti, tl = _v3_name_initial_last_parts(player)
+        if ti and tl:
+            # Initial + last-name match.
+            tmp = d[[pcol, "_v3_player_norm"]].dropna().drop_duplicates().copy()
+            def ok(x):
+                fi, la = _v3_name_initial_last_parts(x)
+                return fi == ti and la == tl
+            cand = tmp[tmp[pcol].astype(str).map(ok)]
+            if not cand.empty:
+                # prefer most recent logged display name
+                return str(cand[pcol].astype(str).iloc[-1])
+
+        # Fuzzy fallback with strong threshold.
+        try:
+            names = d[pcol].dropna().astype(str).drop_duplicates().tolist()
+            best, best_score = "", 0.0
+            for nm in names:
+                sc = name_score(player, nm) if callable(globals().get("name_score")) else 0.0
+                if sc > best_score:
+                    best, best_score = nm, sc
+            if best and best_score >= 0.78:
+                return str(best)
+        except Exception:
+            pass
+        return str(player or "")
+    except Exception:
+        return str(player or "")
+
+def _v3_player_batter_logs(player):
+    """Overridden: exact + abbreviation/fuzzy player matching for batter logs."""
+    df = _v3_batter_logs_df()
+    if not isinstance(df, pd.DataFrame) or df.empty:
+        return pd.DataFrame()
+    pcol = _v3_col(df, ["Player", "Batter", "Name", "player", "batter_name"])
+    if not pcol:
+        return pd.DataFrame()
+    matched_name = _v3_best_batter_log_name_match(player)
+    d = df.copy()
+    d["_v3_player_norm"] = d[pcol].map(_v3_norm_name)
+    target_norm = _v3_norm_name(matched_name)
+    d = d[d["_v3_player_norm"] == target_norm].copy()
+    if d.empty:
+        return d
+    date_col = _v3_col(d, ["Date", "Game Date", "game_date"])
+    if date_col:
+        d["_v3_date"] = pd.to_datetime(d[date_col], errors="coerce")
+        d = d.sort_values("_v3_date")
+    return d
+
+def _v3_is_hrr_blob(blob):
+    low = str(blob or "").lower()
+    good = [
+        "hits+runs+rbis", "hits + runs + rbis", "hits runs rbis",
+        "h+r+rbi", "h + r + rbi", "h+r+r", "hits+runs+rbi",
+        "hits + runs + rbi", "hits, runs and rbis", "hits runs and rbis"
+    ]
+    if not any(x in low for x in good):
+        return False
+    bad = ["pitcher", "strikeout", "strikeouts", "pitching outs", "hits allowed",
+           "nba", "wnba", "nfl", "nhl", "soccer", "tennis", "golf", "basketball", "football"]
+    return not any(x in low for x in bad)
+
+def _v3_fetch_ud_hrr_rows_direct():
+    """Direct Underdog parser for H+R+RBI lines using the same relationship parser as FS."""
+    rows = []
+    debug = {'urls':0, 'objects':0, 'line_candidates':0, 'hrr_market_hits':0, 'matched_to_logs':0,
+             'rejected_no_log_match':0, 'sample_markets':[], 'version':V3_TAB_STABILITY_FS_HRR_MATCH_VERSION}
+    try:
+        # First try existing helper if available.
+        fn = globals().get("fetch_underdog_batter_prop_rows")
+        if callable(fn):
+            for r in (fn() or []):
+                blob = " ".join(str(r.get(k, "")) for k in r.keys())
+                if not _v3_is_hrr_blob(blob):
+                    continue
+                player = r.get("Player") or r.get("Name") or _v3_player_from_fs_blob(blob, r)
+                line = _v3_safe_num(r.get("Line"), None)
+                if line is None:
+                    line = _v3_line_from_blob_or_objs(blob, r)
+                player = _v3_best_batter_log_name_match(player)
+                logs = _v3_player_batter_logs(player)
+                if player and line is not None and not logs.empty:
+                    rows.append({"Source":"Underdog", "Player":player, "Market":"H+R+RBI", "Line":float(line), "Evidence":blob[:260]})
+                    debug["matched_to_logs"] += 1
+    except Exception as e:
+        debug["helper_error"] = str(e)[:180]
+
+    for url in UNDERDOG_URLS:
+        data = safe_get_json(url, timeout=18)
+        if not data:
+            continue
+        debug["urls"] += 1
+        objects = _v3_collect_json_objects(data)
+        debug["objects"] += len(objects)
+        by_key, by_id = _v3_build_obj_maps(objects)
+        candidates = []
+        for o in objects:
+            a = _v3_attrs(o)
+            typ = _v3_obj_type(o)
+            if 'over_under_line' in typ or any(a.get(k) not in [None,''] for k in ['stat_value','line_score','over_under_line','target_value','line','points','display_stat_value']):
+                candidates.append(o)
+        debug["line_candidates"] += len(candidates)
+        for line_obj in candidates:
+            related = _v3_rel_multi(line_obj, by_key, by_id)
+            blob = _v3_text_from(*related)
+            try:
+                blob = (blob + " | " + json.dumps(line_obj, default=str)[:650])[:1800]
+            except Exception:
+                pass
+            if ("hit" in blob.lower() and "rbi" in blob.lower()) and len(debug["sample_markets"]) < 12:
+                debug["sample_markets"].append(blob[:220])
+            if not _v3_is_hrr_blob(blob):
+                continue
+            debug["hrr_market_hits"] += 1
+            line = _v3_line_from_blob_or_objs(blob, *related)
+            player = _v3_player_from_fs_blob(blob, *related)
+            if not player or line is None:
+                continue
+            player = _v3_best_batter_log_name_match(player)
+            logs = _v3_player_batter_logs(player)
+            if logs.empty:
+                debug["rejected_no_log_match"] += 1
+                continue
+            rows.append({"Source":"Underdog", "Player":player, "Market":"H+R+RBI", "Line":float(line), "Evidence":blob[:260]})
+            debug["matched_to_logs"] += 1
+
+    dedup = {}
+    for r in rows:
+        dedup[(_v3_norm_name(r.get("Player")), "HRR")] = r
+    out = list(dedup.values())
+    debug["final_rows"] = len(out)
+    try:
+        st.session_state["hrr_ud_debug"] = debug
+    except Exception:
+        pass
+    return out
+
+def _v3_ud_hrr_rows():
+    """Overridden: posted Underdog H+R+RBI rows only, matched to loaded batter logs."""
+    return _v3_fetch_ud_hrr_rows_direct()
+
+# Preserve original builder but add light caching/guarding.
+def _v3_safe_render_tab(label, fn, *args, **kwargs):
+    """Never leave a tab blank; show the exception/debug info instead."""
+    try:
+        with st.spinner(f"Loading {label}..."):
+            return fn(*args, **kwargs)
+    except Exception as e:
+        st.error(f"{label} could not render.")
+        st.exception(e)
+        return None
+
+
 # V3 FAST UI: heavy maintenance/debug tabs are hidden from the main workflow.
 # Season data and FS Underdog watcher logic still run through backend/cache paths,
 # but their full debug UIs are not rendered every refresh.
@@ -24753,13 +24962,13 @@ with tab_research_hub:
     render_research_hub_tab(board)
 
 with tab_batter_fs:
-    render_v3_batter_research_tab("FS")
+    _v3_safe_render_tab("Batter FS", render_v3_batter_research_tab, "FS")
 
 with tab_hrr:
-    render_v3_batter_research_tab("HRR")
+    _v3_safe_render_tab("H+R+RBI", render_v3_batter_research_tab, "HRR")
 
 with tab_moneyline:
-    render_moneyline_edge_tab(board, dates)
+    _v3_safe_render_tab("Moneyline Edge", render_moneyline_edge_tab, board, dates)
 
 # Hidden from visible tabs for speed: Season Data UI and FS UD Watcher UI.
 # Data loading remains available via backend cached loaders and learning_data files.
