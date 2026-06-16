@@ -26,13 +26,13 @@ APP_VERSION = "MLB PROP V3 ENGINE — Pitching • Batter FS • H+R+RBI"
 # =========================
 # V3 TEST PATCH — 40% SUPPRESSION + IP ACCURACY TEST
 # =========================
-V3_TEST_PATCH_VERSION = "V3_40_SUPPRESSION_IP_TEST_RESEARCH_HUB_2026_06_15"
+V3_TEST_PATCH_VERSION = "V3_40_SUPPRESSION_IP_TEST_RESEARCH_HUB_IP_PLUS_2026_06_16"
 # 0.40 means the old suppression effect is only applied at 40% strength.
 # Keeps upside alive while reducing over-reactions from suppression fully OFF.
 V3_PARTIAL_SUPPRESSION_STRENGTH = 0.40
 # IP test is intentionally small and capped so it cannot wreck the engine.
 V3_IP_ACCURACY_TEST_ENABLED = True
-V3_IP_ACCURACY_MAX_ADJ = 0.45
+V3_IP_ACCURACY_MAX_ADJ = 0.60
 
 
 try:
@@ -1546,9 +1546,72 @@ def v3_role_stability_from_ip(ip_vals, pitch_count_profile=None, manager_hook_st
     return score, label, "; ".join(notes[:5]) if notes else "normal role profile"
 
 
-def v3_ip_accuracy_adjustment(projected_ip, ip_from_bf, recent_l3_ip, recent_l5_ip, recent_l10_ip, pitch_count_profile=None, manager_hook_status=None, game_script_risk=None):
+
+def v3_team_leash_score_profile(recent_ip_vals=None, pitch_count_profile=None, manager_hook_status=None, bullpen_usage=None):
+    """V3 IP+ helper: estimates how likely the pitcher/team is to allow starter length.
+
+    This is a small innings-context model only. It does not touch pitcher K skill.
+    Uses real recent IP, recent pitch-count label, manager hook label, and bullpen workload.
+    """
+    vals = [float(x) for x in (recent_ip_vals or []) if x is not None]
+    l5 = vals[:5]
+    score = 50.0
+    reasons = []
+
+    if l5:
+        avg_l3 = sum(l5[:3]) / max(1, len(l5[:3]))
+        avg_l5 = sum(l5) / len(l5)
+        deep5 = sum(1 for x in l5 if x >= 5.0)
+        deep6 = sum(1 for x in l5 if x >= 6.0)
+        short4 = sum(1 for x in l5 if x < 4.0)
+        if avg_l5 >= 5.8:
+            score += 16; reasons.append(f"L5 IP avg {avg_l5:.1f}")
+        elif avg_l5 >= 5.2:
+            score += 8; reasons.append(f"L5 IP solid {avg_l5:.1f}")
+        elif avg_l5 <= 4.2:
+            score -= 14; reasons.append(f"L5 IP low {avg_l5:.1f}")
+        if avg_l3 >= avg_l5 + 0.45:
+            score += 7; reasons.append("L3 leash rising")
+        elif avg_l3 <= avg_l5 - 0.45:
+            score -= 7; reasons.append("L3 leash falling")
+        if deep6 >= 2:
+            score += 7; reasons.append("multiple 6+ IP starts")
+        if deep5 >= 4:
+            score += 5; reasons.append("regular 5+ IP")
+        if short4 >= 2:
+            score -= 12; reasons.append("multiple short starts")
+    else:
+        score -= 8; reasons.append("no recent IP sample")
+
+    pc_label = str((pitch_count_profile or {}).get("label") or "").upper()
+    pc_avg_l3 = safe_float((pitch_count_profile or {}).get("avg_l3"), None)
+    if pc_label in ["ELITE_VOLUME", "FULL_LEASH"] or (pc_avg_l3 is not None and pc_avg_l3 >= 96):
+        score += 10; reasons.append("pitch count supports leash")
+    elif pc_label in ["SHORT_LEASH", "MONITOR"] or (pc_avg_l3 is not None and pc_avg_l3 <= 82):
+        score -= 10; reasons.append("pitch count limits leash")
+
+    hook = str(manager_hook_status or "").upper()
+    if hook == "STRICT_HOOK":
+        score -= 12; reasons.append("strict manager hook")
+    elif hook == "NORMAL":
+        score += 3
+
+    if isinstance(bullpen_usage, dict):
+        bp_label = str(bullpen_usage.get("label") or "").upper()
+        bp_pitches = safe_float(bullpen_usage.get("bullpen_pitches"), 0) or 0
+        bp_ip = safe_float(bullpen_usage.get("bullpen_ip"), 0) or 0
+        if bp_label in ["TIRED", "VERY_TIRED", "HEAVY"] or bp_pitches >= 200 or bp_ip >= 14:
+            score += 8; reasons.append("bullpen workload may extend starter")
+        elif bp_label in ["FRESH"] or (bp_pitches <= 100 and bp_ip <= 7):
+            score -= 4; reasons.append("fresh bullpen quick-hook risk")
+
+    score = int(clamp(score, 0, 100))
+    label = "DEEP_LEASH" if score >= 78 else "NORMAL_LEASH" if score >= 60 else "LEASH_WATCH" if score >= 45 else "SHORT_LEASH_RISK"
+    return {"score": score, "label": label, "note": "; ".join(reasons[:6]) if reasons else "neutral leash profile"}
+
+def v3_ip_accuracy_adjustment(projected_ip, ip_from_bf, recent_l3_ip, recent_l5_ip, recent_l10_ip, pitch_count_profile=None, manager_hook_status=None, game_script_risk=None, recent_ip_vals=None, bullpen_usage=None):
     """Small V3 test nudge to get innings closer without letting IP swing wildly.
-    Max move is V3_IP_ACCURACY_MAX_ADJ, default 0.45 innings.
+    Max move is V3_IP_ACCURACY_MAX_ADJ, default 0.60 innings in IP+ test.
     """
     if not globals().get("V3_IP_ACCURACY_TEST_ENABLED", True):
         return float(projected_ip), 0.0, "IP test OFF", 50, "OFF"
@@ -1562,7 +1625,8 @@ def v3_ip_accuracy_adjustment(projected_ip, ip_from_bf, recent_l3_ip, recent_l5_
         n = safe_float(v, None)
         if n is not None:
             vals.append(n)
-    role_score, role_label, role_note = v3_role_stability_from_ip(vals, pitch_count_profile=pitch_count_profile, manager_hook_status=manager_hook_status)
+    role_score, role_label, role_note = v3_role_stability_from_ip((recent_ip_vals or vals), pitch_count_profile=pitch_count_profile, manager_hook_status=manager_hook_status)
+    team_leash = v3_team_leash_score_profile(recent_ip_vals=(recent_ip_vals or vals), pitch_count_profile=pitch_count_profile, manager_hook_status=manager_hook_status, bullpen_usage=bullpen_usage)
     if recent_l5_ip is not None:
         diff = float(recent_l5_ip) - float(base)
         if diff >= 0.85:
@@ -1575,6 +1639,12 @@ def v3_ip_accuracy_adjustment(projected_ip, ip_from_bf, recent_l3_ip, recent_l5_
                 adj += 0.12; notes.append("L3 leash rising")
             elif l3diff <= -0.55:
                 adj -= 0.12; notes.append("L3 leash falling")
+        if recent_l10_ip is not None:
+            l5_l10_diff = float(recent_l5_ip) - float(recent_l10_ip)
+            if l5_l10_diff >= 0.45:
+                adj += 0.08; notes.append("L5 above L10")
+            elif l5_l10_diff <= -0.45:
+                adj -= 0.08; notes.append("L5 below L10")
     pc_label = str((pitch_count_profile or {}).get("label") or "").upper()
     if pc_label in ["ELITE_VOLUME", "FULL_LEASH"]:
         adj += 0.10; notes.append(f"{pc_label} support")
@@ -1586,6 +1656,14 @@ def v3_ip_accuracy_adjustment(projected_ip, ip_from_bf, recent_l3_ip, recent_l5_
     gs_label = str((game_script_risk or {}).get("label") or "").upper() if isinstance(game_script_risk, dict) else ""
     if gs_label in ["HIGH", "EXTREME"]:
         adj -= 0.10; notes.append("game-script pull risk")
+    tl_score = safe_float((team_leash or {}).get("score"), 50) or 50
+    tl_label = str((team_leash or {}).get("label") or "")
+    if tl_score >= 78:
+        adj += 0.12; notes.append(f"team leash {tl_label}")
+    elif tl_score < 45:
+        adj -= 0.12; notes.append(f"team leash {tl_label}")
+    elif tl_score >= 60:
+        adj += 0.04; notes.append(f"team leash {tl_label}")
     # role score acts as a tiny guardrail, not a full projection engine.
     if role_score >= 78:
         adj += 0.08
@@ -1593,11 +1671,11 @@ def v3_ip_accuracy_adjustment(projected_ip, ip_from_bf, recent_l3_ip, recent_l5_
         adj -= 0.12
     cap = safe_float(globals().get("V3_IP_ACCURACY_MAX_ADJ", 0.45), 0.45) or 0.45
     adj = float(clamp(adj, -cap, cap))
-    new_ip = float(clamp(base + adj, 3.0, 7.6))
-    note = f"V3 IP test {adj:+.2f}: " + ("; ".join(notes[:5]) if notes else "neutral") + f" | role {role_label} {role_score}/100"
+    new_ip = float(clamp(base + adj, 2.4, 8.1))
+    note = f"V3 IP+ test {adj:+.2f}: " + ("; ".join(notes[:6]) if notes else "neutral") + f" | role {role_label} {role_score}/100 | leash {(team_leash or {}).get("label", "—")} {(team_leash or {}).get("score", "—")}/100"
     return new_ip, round(adj, 2), note, role_score, role_label
 
-def build_innings_outcome_module(recent_rows, expected_bf, ppb=None, pitch_count_profile=None, manager_hook_status=None, game_script_risk=None):
+def build_innings_outcome_module(recent_rows, expected_bf, ppb=None, pitch_count_profile=None, manager_hook_status=None, game_script_risk=None, bullpen_usage=None):
     """Project starter innings outcome and early-pull risk from real recent IP/BF/pitch-count data."""
     rows = list(recent_rows or [])
     ip_vals, bf_vals, bf_per_ip_vals = [], [], []
@@ -1616,7 +1694,13 @@ def build_innings_outcome_module(recent_rows, expected_bf, ppb=None, pitch_count
     recent_l3_ip = float(np.mean(ip_vals[:3])) if ip_vals else None
     recent_l5_ip = float(np.mean(ip_vals[:5])) if ip_vals else recent_l3_ip
     recent_l10_ip = float(np.mean(ip_vals[:10])) if ip_vals else recent_l5_ip
-    projected_ip = (ip_from_bf * 0.68 + recent_l5_ip * 0.32) if recent_l5_ip is not None else ip_from_bf
+    # V3 IP+: more recent usage weighted, while BF model remains the anchor.
+    if recent_l5_ip is not None and recent_l10_ip is not None:
+        projected_ip = (ip_from_bf * 0.45) + (recent_l5_ip * 0.40) + (recent_l10_ip * 0.15)
+    elif recent_l5_ip is not None:
+        projected_ip = (ip_from_bf * 0.55) + (recent_l5_ip * 0.45)
+    else:
+        projected_ip = ip_from_bf
     pc_label = str((pitch_count_profile or {}).get("label") or "").upper()
     hook = str(manager_hook_status or "").upper()
     gs_label = str((game_script_risk or {}).get("label") or "").upper() if isinstance(game_script_risk, dict) else ""
@@ -1644,6 +1728,8 @@ def build_innings_outcome_module(recent_rows, expected_bf, ppb=None, pitch_count
             pitch_count_profile=pitch_count_profile,
             manager_hook_status=manager_hook_status,
             game_script_risk=game_script_risk,
+            recent_ip_vals=ip_vals,
+            bullpen_usage=bullpen_usage,
         )
     except Exception as _v3ip_e:
         v3_ip_adj, v3_ip_note, v3_role_score, v3_role_label = 0.0, f"V3 IP test skipped: {_v3ip_e}", 50, "UNKNOWN"
@@ -1656,7 +1742,7 @@ def build_innings_outcome_module(recent_rows, expected_bf, ppb=None, pitch_count
         label = "FULL_INNINGS_PROFILE"
     else:
         label = "NORMAL_INNINGS"
-    projected_ip = float(clamp(projected_ip, 3.0, 7.6))
+    projected_ip = float(clamp(projected_ip, 2.4, 8.1))
     low_ip = float(clamp(projected_ip - (0.75 if risk_score < 62 else 1.05), 2.0, 8.0))
     high_ip = float(clamp(projected_ip + (0.70 if risk_score < 62 else 0.45), 2.0, 8.2))
     projected_pitches = None
@@ -1678,6 +1764,9 @@ def build_innings_outcome_module(recent_rows, expected_bf, ppb=None, pitch_count
         "v3_ip_test_note": v3_ip_note if 'v3_ip_note' in locals() else "V3 IP test unavailable",
         "v3_role_stability_score": v3_role_score if 'v3_role_score' in locals() else 50,
         "v3_role_stability_label": v3_role_label if 'v3_role_label' in locals() else "UNKNOWN",
+        "v3_team_leash_score": (team_leash or {}).get("score") if 'team_leash' in locals() else None,
+        "v3_team_leash_label": (team_leash or {}).get("label") if 'team_leash' in locals() else None,
+        "v3_team_leash_note": (team_leash or {}).get("note") if 'team_leash' in locals() else None,
         "note": f"Innings outcome {label}: IP {projected_ip:.1f} range {low_ip:.1f}-{high_ip:.1f}; " + "; ".join(note_bits) + (" | " + (v3_ip_note if 'v3_ip_note' in locals() else "")),
     }
 
@@ -7575,6 +7664,7 @@ def make_projection(row, bankroll, default_odds, use_statcast, use_pitch_type, u
             pitch_count_profile=pitch_count_profile if "pitch_count_profile" in locals() else {},
             manager_hook_status=leash.get("manager_hook_status"),
             game_script_risk=game_script_risk if "game_script_risk" in locals() else {},
+            bullpen_usage=bullpen_usage if "bullpen_usage" in locals() else {},
         )
     except Exception as _ip_e:
         innings_outcome = {
@@ -8037,6 +8127,9 @@ def make_projection(row, bankroll, default_odds, use_statcast, use_pitch_type, u
         "v3_ip_test_note": innings_outcome.get("v3_ip_test_note"),
         "v3_role_stability_score": innings_outcome.get("v3_role_stability_score"),
         "v3_role_stability_label": innings_outcome.get("v3_role_stability_label"),
+        "v3_team_leash_score": innings_outcome.get("v3_team_leash_score"),
+        "v3_team_leash_label": innings_outcome.get("v3_team_leash_label"),
+        "v3_team_leash_note": innings_outcome.get("v3_team_leash_note"),
         "recent_ip_l3": innings_outcome.get("recent_ip_l3"),
         "recent_ip_l5": innings_outcome.get("recent_ip_l5"),
         "recent_ip_l10": innings_outcome.get("recent_ip_l10"),
