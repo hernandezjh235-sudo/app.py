@@ -6704,7 +6704,15 @@ def _owp_sgo_collect_priced_pitcher_k_rows(data, player_name):
         return None
 
     def get_parent_price(obj):
-        v = first_in(obj, ["bookOdds", "book_odds", "odds", "price", "americanOdds", "american_odds", "fairOdds", "fair_odds"])
+        # Prefer bookOdds for market price, but fall back to fairOdds so the card
+        # can still show no-vig/consensus when the user's SGO plan hides bookmaker rows.
+        v = first_in(obj, [
+            "bookOdds", "book_odds", "consensusOdds", "consensus_odds",
+            "odds", "price", "americanOdds", "american_odds",
+            "fairOdds", "fair_odds", "openBookOdds", "openFairOdds"
+        ])
+        if isinstance(v, dict):
+            v = first_in(v, ["american", "americanOdds", "odds", "price", "value"])
         if v is None:
             return None
         return safe_float(str(v).replace("+", ""))
@@ -6714,7 +6722,9 @@ def _owp_sgo_collect_priced_pitcher_k_rows(data, player_name):
             return None
         if book_obj.get("available") is False:
             return None
-        v = first_in(book_obj, ["odds", "bookOdds", "book_odds", "price", "americanOdds", "american_odds"])
+        v = first_in(book_obj, ["odds", "bookOdds", "book_odds", "price", "americanOdds", "american_odds", "fairOdds", "openOdds", "closeOdds"])
+        if isinstance(v, dict):
+            v = first_in(v, ["american", "americanOdds", "odds", "price", "value"])
         if v is None:
             return None
         return safe_float(str(v).replace("+", ""))
@@ -6849,6 +6859,19 @@ def _owp_sgo_collect_priced_pitcher_k_rows(data, player_name):
 
     return list(dedup.values())
 
+
+def _owp_sgo_player_id_guess(player_name):
+    """Best-effort SportsGameOdds MLB playerID guess from display name.
+    Example: Chase Burns -> CHASE_BURNS_1_MLB. This is used only to ask SGO
+    for that exact oddID; if SGO returns nothing, normal broad parsing still runs.
+    """
+    t = str(player_name or "").strip()
+    t = re.sub(r"[^A-Za-z0-9\s']+", " ", t)
+    t = re.sub(r"\s+", "_", t.strip()).upper()
+    if not t:
+        return ""
+    return f"{t}_1_MLB"
+
 @st.cache_data(ttl=180, show_spinner=False)
 def get_sportsgameodds_k_data(player_name):
     """SportsGameOdds market-odds feed for pitcher strikeouts.
@@ -6861,13 +6884,31 @@ def get_sportsgameodds_k_data(player_name):
         return source_result("SportsGameOdds", "DISABLED", rows=[], message="Add SPORTSGAMEODDS_API_KEY in sidebar, Streamlit secrets, or environment")
 
     headers = {"X-Api-Key": SPORTSGAMEODDS_API_KEY, "Authorization": f"Bearer {SPORTSGAMEODDS_API_KEY}"}
-    endpoints = [
+    # Direct oddID request comes first. It prevents the app from missing a player
+    # because the general /events page/limit did not include their event or alt line.
+    sgo_pid = _owp_sgo_player_id_guess(player_name)
+    direct_oddids = ""
+    if sgo_pid:
+        direct_oddids = f"pitching_strikeouts-{sgo_pid}-game-ou-over,pitching_strikeouts-{sgo_pid}-game-ou-under"
+
+    endpoints = []
+    if direct_oddids:
+        endpoints.append((f"{SPORTSGAMEODDS_BASE}/events/", {
+            "apiKey": SPORTSGAMEODDS_API_KEY,
+            "leagueID": "MLB",
+            "oddID": direct_oddids,
+            "includeOpposingOdds": "true",
+            "includeAltLines": "true",
+            "bookmakerID": "draftkings,fanduel,betmgm,caesars,espnbet,fanatics,bet365,pinnacle",
+            "limit": 25,
+        }))
+    endpoints += [
         (f"{SPORTSGAMEODDS_BASE}/events/", {
             "apiKey": SPORTSGAMEODDS_API_KEY,
             "oddsAvailable": "true",
             "leagueID": "MLB",
             "includeOpposingOdds": "true",
-            "includeAltLines": "false",
+            "includeAltLines": "true",
             "bookmakerID": "draftkings,fanduel,betmgm,caesars,espnbet,fanatics,bet365,pinnacle",
             "limit": 200,
         }),
@@ -6876,7 +6917,7 @@ def get_sportsgameodds_k_data(player_name):
             "oddsPresent": "true",
             "leagueID": "MLB",
             "includeOpposingOdds": "true",
-            "includeAltLines": "false",
+            "includeAltLines": "true",
             "limit": 200,
         }),
     ]
