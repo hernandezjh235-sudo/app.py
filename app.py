@@ -6551,27 +6551,21 @@ def get_underdog_k_data(player_name):
 def _owp_sgo_collect_priced_pitcher_k_rows(data, player_name):
     """SportsGameOdds parser for pitcher-K priced odds.
 
-    This parser is intentionally broad because SportsGameOdds responses can be
-    nested by event / market / bookmaker / outcome. It only returns rows that:
-      - name-match the pitcher,
-      - look like strikeout props,
-      - have a valid K line,
-      - have an OVER or UNDER side,
-      - have an American price.
+    FIXED v11.17 fair-odds tester:
+    SportsGameOdds /v2/events returns odds mostly as an event-level `odds`
+    dictionary. Each odd object carries `oddID`, `marketName`, `statID`,
+    `playerID/statEntityID`, `sideID`, `bookOverUnder/fairOverUnder`, and a
+    nested `byBookmaker` dict with prices. The previous broad walker often
+    looked at the bookmaker child row by itself, which has the price/line but
+    not the player + market, so cards fell back to NO_MARKET.
 
-    These rows are market-only. They never set the active Underdog line and they
-    never change K projection math.
+    This parser keeps the projection engine untouched. It only extracts market
+    rows for exact-line no-vig comparison later.
     """
     rows = []
     target = normalize_name(player_name)
     if not target:
         return rows
-
-    def text_blob(obj):
-        try:
-            return json.dumps(obj, ensure_ascii=False).lower()[:6000]
-        except Exception:
-            return str(obj).lower()[:6000]
 
     def first_in(obj, keys):
         if not isinstance(obj, dict):
@@ -6594,110 +6588,205 @@ def _owp_sgo_collect_priced_pitcher_k_rows(data, player_name):
             for v in obj:
                 yield from walk(v)
 
-    def side_from(obj, blob, default=None):
-        raw = first_in(obj, ["side", "betType", "bet_type", "outcome", "label", "name", "selection", "type"])
-        raw_txt = str(raw or "").lower()
-        if "over" in raw_txt or raw_txt in ["o", "over"]:
-            return "OVER"
-        if "under" in raw_txt or raw_txt in ["u", "under"]:
+    def as_text(obj, max_len=12000):
+        try:
+            return json.dumps(obj, ensure_ascii=False)[:max_len]
+        except Exception:
+            return str(obj)[:max_len]
+
+    def norm_from_id(x):
+        # SGO playerIDs usually look like LOGAN_GILBERT_1_MLB
+        t = str(x or "")
+        t = re.sub(r"_\d+_MLB$", "", t, flags=re.I)
+        t = re.sub(r"_MLB$", "", t, flags=re.I)
+        return normalize_name(t)
+
+    def pitcher_k_market(obj, odd_key=""):
+        txt = (str(odd_key) + " " + str(first_in(obj, ["oddID", "oddId", "marketName", "market_name", "statID", "stat", "displayName", "name"]) or "")).lower()
+        # SportsGameOdds statID/oddID can vary by feed; accept common pitcher-K spellings.
+        good = any(x in txt for x in [
+            "strikeout", "strikeouts", "pitcher strikeouts", "pitcher_strikeouts",
+            "pitchingstrikeouts", "pitching_strikeouts", "player_pitcher_strikeouts",
+            "k_recorded", "ks", "-ks-", "_ks_"
+        ])
+        # Avoid team/batter K and other baseball prop contamination.
+        bad = any(x in txt for x in [
+            "team strikeout", "team_strikeout", "batter", "hitter", "earnedruns",
+            "earned runs", "outs", "walks", "hits", "home", "rbi", "totalbases"
+        ])
+        # SGO MLB docs describe pitcher props by stat type. Some feeds use a generic statID
+        # but marketName makes it clear.
+        return good and not bad
+
+    def get_side(obj, odd_key=""):
+        raw = first_in(obj, ["sideID", "sideId", "side", "outcome", "selection", "label", "name", "type"])
+        txt = (str(raw or "") + " " + str(odd_key or "")).lower()
+        if "under" in txt or txt.strip() in ("u", "under") or txt.endswith("-under"):
             return "UNDER"
-        if default:
-            return default
-        if "\"over\"" in blob or " over " in blob:
+        if "over" in txt or txt.strip() in ("o", "over") or txt.endswith("-over"):
             return "OVER"
-        if "\"under\"" in blob or " under " in blob:
-            return "UNDER"
         return None
 
-    def price_from(obj, side=None):
-        if not isinstance(obj, dict):
+    def get_line(obj, book_obj=None):
+        # Parent odd object usually has bookOverUnder/fairOverUnder; bookmaker row has overUnder.
+        keys = [
+            "bookOverUnder", "book_over_under", "fairOverUnder", "fair_over_under",
+            "openBookOverUnder", "open_book_over_under", "openFairOverUnder", "open_fair_over_under",
+            "overUnder", "over_under", "line", "point", "points", "total", "value", "statValue", "stat_value"
+        ]
+        for source in (book_obj, obj):
+            if not isinstance(source, dict):
+                continue
+            v = first_in(source, keys)
+            line = is_valid_k_line(safe_float(v), allow_integer=True)
+            if line is not None:
+                return float(line)
+        return None
+
+    def get_parent_price(obj):
+        v = first_in(obj, ["bookOdds", "book_odds", "odds", "price", "americanOdds", "american_odds", "fairOdds", "fair_odds"])
+        if v is None:
             return None
-        if side == "OVER":
-            v = first_in(obj, ["overOdds", "over_odds", "overPrice", "over_price", "overAmericanOdds", "over_american_odds"])
-            if v is not None:
-                return safe_float(str(v).replace("+", ""))
-        if side == "UNDER":
-            v = first_in(obj, ["underOdds", "under_odds", "underPrice", "under_price", "underAmericanOdds", "under_american_odds"])
-            if v is not None:
-                return safe_float(str(v).replace("+", ""))
-        v = first_in(obj, ["americanOdds", "american_odds", "american", "price", "odds", "moneyline"])
-        return safe_float(str(v).replace("+", "")) if v is not None else None
+        return safe_float(str(v).replace("+", ""))
 
-    def line_from(obj):
-        v = first_in(obj, ["line", "point", "points", "total", "handicap", "value", "statValue", "stat_value", "overUnder", "over_under", "overUnderLine", "over_under_line"])
-        return is_valid_k_line(safe_float(v), allow_integer=True)
+    def get_book_price(book_obj):
+        if not isinstance(book_obj, dict):
+            return None
+        if book_obj.get("available") is False:
+            return None
+        v = first_in(book_obj, ["odds", "bookOdds", "book_odds", "price", "americanOdds", "american_odds"])
+        if v is None:
+            return None
+        return safe_float(str(v).replace("+", ""))
 
-    def player_from(obj):
-        vals=[]
-        for k in ["playerName", "player_name", "player", "participantName", "participant_name", "participant", "competitorName", "competitor_name", "name", "description", "displayName", "display_name"]:
+    def player_match_from_odd(obj, odd_key=""):
+        vals = []
+        for k in ["playerName", "player_name", "player", "participantName", "participant_name", "competitorName", "displayName", "display_name", "name"]:
             v = first_in(obj, [k])
             if isinstance(v, dict):
                 v = first_in(v, ["name", "fullName", "full_name", "displayName", "display_name"])
             if v:
                 vals.append(str(v))
-        return " ".join(vals)
-
-    def provider_from(obj):
-        v = first_in(obj, ["sportsbook", "book", "bookmaker", "operator", "provider", "source", "sportsbookName", "sportsbook_name"])
-        if isinstance(v, dict):
-            v = first_in(v, ["name", "title", "key"])
-        return str(v or "SportsGameOdds")
+        for k in ["playerID", "playerId", "statEntityID", "stat_entity_id", "participantID", "participantId"]:
+            v = first_in(obj, [k])
+            if v:
+                vals.append(norm_from_id(v))
+        if odd_key:
+            # Extract the player chunk from oddID like stat-PLAYER_ID-game-ou-over.
+            parts = str(odd_key).split("-")
+            if len(parts) >= 2:
+                vals.append(norm_from_id(parts[1]))
+        # Return best score and display name.
+        best_score, best_name = 0.0, ""
+        for v in vals:
+            sc = name_score(player_name, v)
+            if sc > best_score:
+                best_score, best_name = sc, str(v)
+        # Fallback: full odd object text can include the playerID.
+        blob_norm = normalize_name(as_text(obj, 5000))
+        if target in blob_norm and best_score < 0.82:
+            best_score, best_name = 0.88, player_name
+        return best_score, best_name or player_name
 
     dedup = {}
+
+    # Primary parse: event-level odds dictionary.
+    for event in walk(data):
+        if not isinstance(event, dict) or "odds" not in event or not isinstance(event.get("odds"), dict):
+            continue
+        odds_dict = event.get("odds") or {}
+        for odd_key, odd in odds_dict.items():
+            if not isinstance(odd, dict):
+                continue
+            if not pitcher_k_market(odd, odd_key):
+                continue
+            score, matched_name = player_match_from_odd(odd, odd_key)
+            if score < 0.80:
+                continue
+            side = get_side(odd, odd_key)
+            if side not in ("OVER", "UNDER"):
+                continue
+            line = get_line(odd)
+            if line is None:
+                continue
+            market_name = first_in(odd, ["marketName", "market_name", "oddID", "oddId", "statID", "stat"]) or str(odd_key)
+            last_update = first_in(odd, ["lastUpdate", "last_update", "updatedAt", "updated_at"])
+
+            # Add the parent consensus/book price if available.
+            parent_px = get_parent_price(odd)
+            if parent_px is not None:
+                key = ("SportsGameOdds", side, float(line), int(parent_px), str(odd_key))
+                dedup[key] = {
+                    "Source": "SportsGameOdds",
+                    "Provider": "SportsGameOdds",
+                    "Player": player_name,
+                    "Matched Name": matched_name[:120],
+                    "Match Score": round(score, 3),
+                    "Market": market_name,
+                    "Side": side,
+                    "Line": float(line),
+                    "Price": int(parent_px),
+                    "Last Update": last_update,
+                    "OddID": str(odd_key),
+                }
+
+            # Add each sportsbook price from byBookmaker.
+            books = odd.get("byBookmaker") if isinstance(odd.get("byBookmaker"), dict) else {}
+            for book, book_obj in books.items():
+                px = get_book_price(book_obj)
+                book_line = get_line(odd, book_obj) or line
+                if px is None or book_line is None:
+                    continue
+                lu = first_in(book_obj, ["lastUpdatedAt", "last_updated_at", "lastUpdate", "last_update"]) or last_update
+                key = (str(book), side, float(book_line), int(px), str(odd_key))
+                dedup[key] = {
+                    "Source": "SportsGameOdds",
+                    "Provider": str(book),
+                    "Player": player_name,
+                    "Matched Name": matched_name[:120],
+                    "Match Score": round(score, 3),
+                    "Market": market_name,
+                    "Side": side,
+                    "Line": float(book_line),
+                    "Price": int(px),
+                    "Last Update": lu,
+                    "OddID": str(odd_key),
+                }
+
+    # Fallback broad parse for any alternate response shape.
     for obj in walk(data):
-        blob = text_blob(obj)
+        if not isinstance(obj, dict):
+            continue
+        blob = as_text(obj, 8000).lower()
         if target not in normalize_name(blob):
             continue
-        if not ("strikeout" in blob or "strikeouts" in blob or "pitcher k" in blob or "pitcher_k" in blob or " ks" in blob):
+        if not pitcher_k_market(obj, first_in(obj, ["oddID", "oddId"]) or ""):
             continue
         if is_bad_sport_text(blob) or is_bad_k_market_text(blob):
             continue
-        cand = player_from(obj) or player_name
-        score = max(name_score(player_name, cand), 0.82 if target in normalize_name(blob) else 0.0)
+        score, matched_name = player_match_from_odd(obj, first_in(obj, ["oddID", "oddId"]) or "")
         if score < 0.80:
             continue
-        line = line_from(obj)
-        if line is None:
-            continue
-
-        # Paired-object format: one object has both over and under prices.
-        for paired_side in ["OVER", "UNDER"]:
-            px = price_from(obj, paired_side)
-            if px is None:
-                continue
-            book = provider_from(obj)
-            key = (book, paired_side, float(line), int(px))
+        side = get_side(obj, first_in(obj, ["oddID", "oddId"]) or "")
+        line = get_line(obj)
+        px = get_parent_price(obj)
+        if side in ("OVER", "UNDER") and line is not None and px is not None:
+            provider = str(first_in(obj, ["bookmaker", "book", "provider", "sportsbook", "source"]) or "SportsGameOdds")
+            key = (provider, side, float(line), int(px), first_in(obj, ["oddID", "oddId"]) or "")
             dedup[key] = {
                 "Source": "SportsGameOdds",
-                "Provider": book,
+                "Provider": provider,
                 "Player": player_name,
-                "Matched Name": cand[:120],
+                "Matched Name": matched_name[:120],
                 "Match Score": round(score, 3),
-                "Market": first_in(obj, ["market", "marketName", "market_name", "oddID", "oddId", "stat", "prop"]) or "Pitcher Strikeouts",
-                "Side": paired_side,
-                "Line": float(line),
-                "Price": int(px),
-                "Last Update": first_in(obj, ["lastUpdate", "last_update", "updatedAt", "updated_at"]),
-            }
-
-        # Outcome-object format: one row per side.
-        side = side_from(obj, blob)
-        px = price_from(obj, side)
-        if side in ["OVER", "UNDER"] and px is not None:
-            book = provider_from(obj)
-            key = (book, side, float(line), int(px))
-            dedup[key] = {
-                "Source": "SportsGameOdds",
-                "Provider": book,
-                "Player": player_name,
-                "Matched Name": cand[:120],
-                "Match Score": round(score, 3),
-                "Market": first_in(obj, ["market", "marketName", "market_name", "oddID", "oddId", "stat", "prop"]) or "Pitcher Strikeouts",
+                "Market": first_in(obj, ["marketName", "market_name", "oddID", "oddId", "statID", "stat"]) or "Pitcher Strikeouts",
                 "Side": side,
                 "Line": float(line),
                 "Price": int(px),
-                "Last Update": first_in(obj, ["lastUpdate", "last_update", "updatedAt", "updated_at"]),
+                "Last Update": first_in(obj, ["lastUpdate", "last_update", "updatedAt", "updated_at", "lastUpdatedAt"]),
+                "OddID": str(first_in(obj, ["oddID", "oddId"]) or ""),
             }
+
     return list(dedup.values())
 
 @st.cache_data(ttl=180, show_spinner=False)
@@ -6713,9 +6802,23 @@ def get_sportsgameodds_k_data(player_name):
 
     headers = {"X-Api-Key": SPORTSGAMEODDS_API_KEY, "Authorization": f"Bearer {SPORTSGAMEODDS_API_KEY}"}
     endpoints = [
-        (f"{SPORTSGAMEODDS_BASE}/events", {"apiKey": SPORTSGAMEODDS_API_KEY, "oddsAvailable": "true", "leagueID": "MLB", "limit": 200}),
-        (f"{SPORTSGAMEODDS_BASE}/odds", {"apiKey": SPORTSGAMEODDS_API_KEY, "leagueID": "MLB", "limit": 500}),
-        (f"{SPORTSGAMEODDS_BASE}/props", {"apiKey": SPORTSGAMEODDS_API_KEY, "leagueID": "MLB", "limit": 500}),
+        (f"{SPORTSGAMEODDS_BASE}/events/", {
+            "apiKey": SPORTSGAMEODDS_API_KEY,
+            "oddsAvailable": "true",
+            "leagueID": "MLB",
+            "includeOpposingOdds": "true",
+            "includeAltLines": "false",
+            "bookmakerID": "draftkings,fanduel,betmgm,caesars,espnbet,fanatics,bet365,pinnacle",
+            "limit": 200,
+        }),
+        (f"{SPORTSGAMEODDS_BASE}/events/", {
+            "apiKey": SPORTSGAMEODDS_API_KEY,
+            "oddsPresent": "true",
+            "leagueID": "MLB",
+            "includeOpposingOdds": "true",
+            "includeAltLines": "false",
+            "limit": 200,
+        }),
     ]
     all_rows = []
     last_msg = ""
