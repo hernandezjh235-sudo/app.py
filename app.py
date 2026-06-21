@@ -16,6 +16,7 @@ import io
 import unicodedata
 import html
 import hashlib
+import re
 import requests
 import numpy as np
 import pandas as pd
@@ -246,7 +247,7 @@ def get_secret(key, default=""):
 
 # SharpAPI is intentionally hardcoded ONLY for the pitcher-K market/sharp odds feed.
 # Projection, BF/IP, pitch count, lineup, sabermetric, and DIPS engines do not use this key.
-ODDS_API_KEY = "9502336babc0240822c70bad289393f1"  # The Odds API key for pitcher K market/fair-odds advisor.
+ODDS_API_KEY = ""  # Disabled: old OddsAPI path is not active in get_sportsbook_k_data().
 SHARPAPI_KEY = "sk_live_UUk8eejunMDA96uM4vRAQT"
 # Optional manual market odds fallback text is assigned from the Streamlit sidebar at runtime.
 # It is used ONLY for Market/Sharp cards and never changes K projection, BF, IP, pitch count, lineups, or active UD line.
@@ -6137,17 +6138,257 @@ def get_sportsbook_event_pitcher_k_lines(event_id, player_name):
     consensus = float(np.median(line_vals)) if line_vals else rows[0]["Line"]
     return source_result("Sportsbook", "FOUND", line=consensus, rows=rows, message=f"Found {len(rows)} sportsbook outcomes")
 
-def get_sportsbook_k_data(game_home, game_away, player_name):
-    """Return The Odds API pitcher-strikeout odds for Market/Sharp cards only.
 
-    IMPORTANT: This is advisor-only. It does NOT change the projection, BF, IP,
-    pitch count, Underdog active line, or Line-Aware Smart Decision. It only fills
-    the player-card Market / No-Vig Fair / Final Card Signal layer.
+BETTINGPROS_STRIKEOUTS_URL = "https://www.bettingpros.com/mlb/odds/player-props/strikeouts/"
+
+@st.cache_data(ttl=300, show_spinner=False)
+def bettingpros_fetch_strikeouts_page():
+    """Fetch BettingPros MLB strikeout odds page.
+
+    Market-only helper. It never changes projections, Underdog line, BF/IP,
+    slate generation, save/grade, or learning. It only supplies over/under
+    American prices that the card can no-vig.
     """
+    headers = {
+        "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 Safari/604.1",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Cache-Control": "no-cache",
+    }
     try:
-        return get_oddsapi_all_pitcher_k_lines(player_name, game_home, game_away)
+        r = requests.get(BETTINGPROS_STRIKEOUTS_URL, headers=headers, timeout=18)
+        return {"status": r.status_code, "url": str(r.url), "text": r.text if r.status_code == 200 else r.text[:1000]}
     except Exception as e:
-        return source_result("Sportsbook", "FAILED", rows=[], message=f"Odds API pitcher-K lookup failed: {e}")
+        return {"status": "REQUEST_ERROR", "url": BETTINGPROS_STRIKEOUTS_URL, "text": str(e)}
+
+
+def _bp_json_blobs_from_html(html_text):
+    blobs = []
+    text = str(html_text or "")
+    # Next.js / Nuxt / embedded state blocks are the most reliable if present.
+    for pat in [
+        r'<script[^>]+id=["\']__NEXT_DATA__["\'][^>]*>(.*?)</script>',
+        r'window\.__INITIAL_STATE__\s*=\s*(\{.*?\})\s*</script>',
+        r'window\.__NUXT__\s*=\s*(\{.*?\})\s*</script>',
+    ]:
+        for m in re.finditer(pat, text, flags=re.S|re.I):
+            raw = html.unescape(m.group(1)).strip()
+            try:
+                blobs.append(json.loads(raw))
+            except Exception:
+                pass
+    # Some pages place JSON in data attributes. Keep this capped so it cannot be slow.
+    for m in re.finditer(r'\{[^{}]{0,8000}(?:strikeout|Strikeout|pitcher|Pitcher)[^{}]{0,8000}\}', text[:2000000], flags=re.S):
+        raw = html.unescape(m.group(0))
+        try:
+            blobs.append(json.loads(raw))
+        except Exception:
+            continue
+    return blobs
+
+
+def _bp_find_player_text(obj):
+    if not isinstance(obj, dict):
+        return ""
+    keys = [
+        "player", "player_name", "playerName", "full_name", "fullName", "name",
+        "athlete", "athleteName", "participant", "participantName", "description",
+        "display_name", "displayName", "short_name", "shortName"
+    ]
+    vals = []
+    for k in keys:
+        v = obj.get(k)
+        if isinstance(v, dict):
+            for kk in ["name", "full_name", "fullName", "display_name", "displayName"]:
+                if v.get(kk): vals.append(str(v.get(kk)))
+        elif v is not None:
+            vals.append(str(v))
+    return " ".join(vals)
+
+
+def _bp_find_line(obj):
+    if not isinstance(obj, dict):
+        return None
+    keys = [
+        "line", "point", "points", "prop_line", "propLine", "over_line", "under_line",
+        "overLine", "underLine", "value", "handicap", "total", "threshold"
+    ]
+    v = first_value(obj, keys)
+    line = is_valid_k_line(safe_float(v), allow_integer=True)
+    if line is not None:
+        return float(line)
+    blob = " ".join(str(x) for x in list(obj.values())[:25])
+    vals = extract_k_lines_from_text(blob)
+    return float(vals[0]) if vals else None
+
+
+def _bp_find_price(obj, side=None):
+    if not isinstance(obj, dict):
+        return None
+    side_l = str(side or "").lower()
+    if side_l.startswith("over"):
+        keys = ["over_odds", "overOdds", "over_price", "overPrice", "overAmerican", "over_american", "o", "over"]
+    elif side_l.startswith("under"):
+        keys = ["under_odds", "underOdds", "under_price", "underPrice", "underAmerican", "under_american", "u", "under"]
+    else:
+        keys = []
+    # Direct side-specific fields.
+    for k in keys:
+        v = obj.get(k)
+        if isinstance(v, dict):
+            vv = first_value(v, ["price", "american", "odds", "value"])
+        else:
+            vv = v
+        px = safe_float(str(vv).replace("+", "") if vv is not None else None)
+        if px is not None and -10000 < px < 10000:
+            return int(px)
+    # Generic price field on an individual outcome object.
+    v = first_value(obj, ["price", "american", "americanOdds", "odds", "oddsAmerican"])
+    px = safe_float(str(v).replace("+", "") if v is not None else None)
+    return int(px) if px is not None and -10000 < px < 10000 else None
+
+
+def _bp_find_side(obj):
+    if not isinstance(obj, dict):
+        return ""
+    blob = " ".join(str(obj.get(k, "")) for k in ["side", "name", "label", "type", "selection", "outcome", "bet", "market"])
+    low = blob.lower()
+    if "over" in low or re.search(r'\bo\s*\d', low):
+        return "OVER"
+    if "under" in low or re.search(r'\bu\s*\d', low):
+        return "UNDER"
+    return ""
+
+
+def _parse_bettingpros_json_rows(data, player_name):
+    rows, seen = [], set()
+    for obj in _walk_json(data):
+        if not isinstance(obj, dict):
+            continue
+        blob = " ".join(str(v) for v in obj.values())[:5000]
+        if name_score(player_name, _bp_find_player_text(obj)) < 0.80 and name_score(player_name, blob[:300]) < 0.80:
+            continue
+        # Keep only strikeout-looking objects when possible.
+        if not ("strikeout" in blob.lower() or "pitcher" in blob.lower() or " k " in f" {blob.lower()} "):
+            continue
+        line = _bp_find_line(obj)
+        if line is None:
+            continue
+        provider = first_value(obj, ["book", "bookmaker", "sportsbook", "provider", "book_name", "bookName", "site", "title"]) or "BettingPros"
+        matched = _bp_find_player_text(obj) or player_name
+        # Case A: row has both sides.
+        over_px = _bp_find_price(obj, "OVER")
+        under_px = _bp_find_price(obj, "UNDER")
+        for side, px in [("OVER", over_px), ("UNDER", under_px)]:
+            if px is None:
+                continue
+            key = (str(provider), side, float(line), int(px), normalize_name(matched)[:40])
+            if key in seen:
+                continue
+            seen.add(key)
+            rows.append({
+                "Source": "BettingPros", "Provider": str(provider), "Player": player_name,
+                "Matched Name": matched, "Match Score": round(max(name_score(player_name, matched), name_score(player_name, blob[:300])), 3),
+                "Market": "pitcher_strikeouts", "Line": float(line), "Side": side, "Price": int(px),
+                "Last Update": first_value(obj, ["updated", "last_update", "lastUpdate", "updated_at"]),
+            })
+        # Case B: individual outcome object with side + price.
+        side = _bp_find_side(obj)
+        px = _bp_find_price(obj, None)
+        if side in ("OVER", "UNDER") and px is not None:
+            key = (str(provider), side, float(line), int(px), normalize_name(matched)[:40])
+            if key not in seen:
+                seen.add(key)
+                rows.append({
+                    "Source": "BettingPros", "Provider": str(provider), "Player": player_name,
+                    "Matched Name": matched, "Match Score": round(max(name_score(player_name, matched), name_score(player_name, blob[:300])), 3),
+                    "Market": "pitcher_strikeouts", "Line": float(line), "Side": side, "Price": int(px),
+                    "Last Update": first_value(obj, ["updated", "last_update", "lastUpdate", "updated_at"]),
+                })
+    return rows
+
+
+def _parse_bettingpros_visible_html_rows(html_text, player_name):
+    """Last-resort parser for visible BettingPros HTML text.
+
+    It looks near the pitcher name for O/U line-price pairs like O 4.5 (+106).
+    This is intentionally market-only and exact-line filtering happens later.
+    """
+    rows, seen = [], set()
+    text = html.unescape(str(html_text or ""))
+    if not text:
+        return rows
+    norm_player = normalize_name(player_name)
+    # Strip tags but keep spacing around cells.
+    clean = re.sub(r"<[^>]+>", " ", text)
+    clean = re.sub(r"\s+", " ", clean)
+    idxs = []
+    for m in re.finditer(re.escape(player_name), clean, flags=re.I):
+        idxs.append(m.start())
+    # Also last-name search if full name text is abbreviated on page.
+    parts = player_name.split()
+    if len(parts) >= 2 and not idxs:
+        for m in re.finditer(re.escape(parts[-1]), clean, flags=re.I):
+            idxs.append(m.start())
+    for idx in idxs[:4]:
+        win = clean[max(0, idx-600): idx+1600]
+        if name_score(player_name, win[:300]) < 0.55 and normalize_name(parts[-1] if parts else player_name) not in normalize_name(win):
+            continue
+        for side_raw, line_raw, price_raw in re.findall(r'\b([OU])\s*(\d+(?:\.5)?)\s*\(?\s*([+-]\d{2,4})\s*\)?', win, flags=re.I):
+            line = is_valid_k_line(safe_float(line_raw), allow_integer=True)
+            px = safe_float(price_raw.replace("+", ""))
+            if line is None or px is None:
+                continue
+            side = "OVER" if side_raw.upper() == "O" else "UNDER"
+            key = (side, float(line), int(px))
+            if key in seen:
+                continue
+            seen.add(key)
+            rows.append({
+                "Source": "BettingPros", "Provider": "BettingPros", "Player": player_name,
+                "Matched Name": player_name, "Match Score": 0.90, "Market": "pitcher_strikeouts",
+                "Line": float(line), "Side": side, "Price": int(px), "Last Update": None,
+            })
+    return rows
+
+@st.cache_data(ttl=300, show_spinner=False)
+def get_bettingpros_k_data(player_name):
+    fetched = bettingpros_fetch_strikeouts_page()
+    if fetched.get("status") != 200:
+        return source_result("BettingPros", "FAILED", rows=[], message=f"BettingPros fetch failed: {fetched.get('status')}")
+    html_text = fetched.get("text") or ""
+    rows = []
+    for blob in _bp_json_blobs_from_html(html_text):
+        rows.extend(_parse_bettingpros_json_rows(blob, player_name))
+    if not rows:
+        rows.extend(_parse_bettingpros_visible_html_rows(html_text, player_name))
+    # Clean and dedupe.
+    out, seen = [], set()
+    for r in rows:
+        line = is_valid_k_line(r.get("Line"), allow_integer=True)
+        side = str(r.get("Side", "")).upper()
+        px = safe_float(r.get("Price"))
+        if line is None or side not in ("OVER", "UNDER") or px is None:
+            continue
+        key = (side, float(line), int(px), str(r.get("Provider", "")))
+        if key in seen:
+            continue
+        seen.add(key)
+        r["Line"] = float(line); r["Side"] = side; r["Price"] = int(px)
+        out.append(r)
+    if not out:
+        return source_result("BettingPros", "NO MATCH", rows=[], message="No BettingPros strikeout odds matched this pitcher")
+    line_vals = [safe_float(r.get("Line")) for r in out if safe_float(r.get("Line")) is not None]
+    return source_result("BettingPros", "FOUND", line=float(np.median(line_vals)) if line_vals else None, rows=out, message=f"Found {len(out)} BettingPros rows")
+
+def get_sportsbook_k_data(game_home, game_away, player_name):
+    """Return real sportsbook K odds from SharpAPI for market/sharp only.
+
+    Projection independence rule: this source is never used to change pitcher skill,
+    BF, IP, pitch count, lineups, sabermetrics, DIPS, or active Underdog line.
+    It only fills Market / Sharp / agreement cards.
+    """
+    return get_sharpapi_mlb_pitcher_k_lines(player_name, game_home, game_away)
 
 def get_manual_market_k_data(player_name, active_line=None):
     """Manual sportsbook odds fallback for Market/Sharp cards only.
@@ -8267,12 +8508,12 @@ def make_projection(row, bankroll, default_odds, use_statcast, use_pitch_type, u
     sgo_data = get_sportsgameodds_k_data(pitcher_name) if use_sgo else source_result("SportsGameOdds", "OFF", message="Optional source turned off")
     optic_data = get_opticodds_k_data(pitcher_name) if use_optic else source_result("OpticOdds", "OFF", message="Optional source turned off")
 
-    # Keep The Odds API isolated to Market/Sharp only. It should NOT set or shift the active K line.
-    # Active line still comes from Underdog/PrizePicks/optional sources.
-    market_only_blank = source_result("Sportsbook", "MARKET_ONLY", line=None, rows=[], message="Odds API kept out of active-line selection")
+    # Market feeds are advisor-only. They must NOT set or shift the active Underdog K line.
+    market_only_blank = source_result("Sportsbook", "MARKET_ONLY", line=None, rows=[], message="Market feeds kept out of active-line selection")
     active_line, active_source, consensus = choose_active_line(market_only_blank, pp_data, ud_data, sgo_data, optic_data)
 
     manual_market_data = get_manual_market_k_data(pitcher_name, active_line)
+    bettingpros_data = get_bettingpros_k_data(pitcher_name) if use_bettingpros else source_result("BettingPros", "OFF", rows=[], message="BettingPros source turned off")
 
     # v11.8 TRUE CALIBRATION ENGINE:
     # Uses only graded official snapshots. It shifts projection slightly by proven bias buckets,
@@ -8345,7 +8586,7 @@ def make_projection(row, bankroll, default_odds, use_statcast, use_pitch_type, u
         price_is_real = False
         price_source = "NO REAL PRICE"
         priced_rows = []
-        for src in [sportsbook_data, manual_market_data, sgo_data, optic_data]:
+        for src in [bettingpros_data, sportsbook_data, manual_market_data, sgo_data, optic_data]:
             priced_rows.extend(src.get("rows", []))
         market_intel = build_market_odds_intelligence(priced_rows, active_line, pick_side, fair_prob)
         market_side_no_vig = None
@@ -10172,7 +10413,8 @@ with st.sidebar:
     use_weather = st.checkbox("Use live weather adjustment", value=True)
     use_umpire = st.checkbox("Use capped umpire tendency", value=True)
     use_xgboost_assist = st.checkbox("Experimental: capped XGBoost assist", value=False)
-    use_sgo = st.checkbox("SportsGameOdds Fair Odds API — OFF (use Odds API instead)", value=False)
+    use_bettingpros = st.checkbox("BettingPros Strikeout Odds — AUTO", value=True)
+    use_sgo = st.checkbox("SportsGameOdds Fair Odds API — OFF (backup only)", value=False)
     sgo_sidebar_key = st.text_input("SportsGameOdds API key", value="", type="password", help="Optional override. Tester key is already embedded; leave blank unless replacing it.")
     st.caption("Fair odds layer is ON by default. If exact sportsbook line matches UD/Line, card will show no-vig fair odds; otherwise NO EXACT MATCH.")
     if sgo_sidebar_key.strip():
