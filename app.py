@@ -9157,12 +9157,10 @@ if refresh_btn:
     st.success(f"Refreshed {len(projections)} context rows. Nothing officially saved yet.")
 
 if save_btn:
-    if not st.session_state.get("loaded_picks"):
-        st.warning("Refresh the live board first, inspect the lines, then save the official before-game snapshot.")
-    else:
-        added = save_many_once(st.session_state.loaded_picks)
-        st.session_state.last_saved_count = added
-        st.success(f"Saved official before-game snapshot. Added {added} new rows.")
+    # V3 Batter build: save is handled after the batter-board builders are defined.
+    # This lets one Save button persist ALL batter tabs: Batter Upside, Batter FS, H+R+RBI, Home Runs, and Official Plays.
+    st.session_state["v3_batter_save_requested"] = True
+    st.info("Batter snapshot save queued. All batter boards will be saved after the board builders load.")
 
 saved = load_json(PICK_LOG, [])
 
@@ -26809,6 +26807,608 @@ def render_v3_settings_tab():
         st.session_state.loaded_picks = []
         st.session_state.last_refresh_time = None
         st.success("Cache/session display cleared. Refresh the board again.")
+
+
+
+
+# ============================================================
+# ONE WAY PICKZ — V3 BATTER STRUCTURE / SAVE / HIT-RATE PATCH
+# ============================================================
+# Purpose:
+# - Keep this branch batter-focused in the visible workflow.
+# - Save ALL batter boards from the single top Save button.
+# - Let boards reload from the most recent saved batter snapshot when live data is empty.
+# - Tighten batter play filtering so the top view highlights real 80%+ hit-rate profiles.
+# - Does NOT touch pitcher K projection math. Pitcher legacy code may exist in the file, but this V3
+#   display/save layer uses Batter Upside, Batter FS, H+R+RBI, Home Runs, and Official Plays only.
+
+V3_BATTER_SAVE_PATCH_VERSION = "V3_BATTER_SAVE_ALL_BOARDS_HITRATE_80_2026_06_20"
+V3_BATTER_SNAPSHOT_FILE = os.path.join(STORAGE_DIR, "v3_batter_all_boards_snapshot.json")
+V3_BATTER_SNAPSHOT_HISTORY_FILE = os.path.join(STORAGE_DIR, "v3_batter_all_boards_snapshot_history.json")
+
+
+def _v3_batter_df_to_records(df):
+    try:
+        if isinstance(df, pd.DataFrame) and not df.empty:
+            x = df.copy()
+            # JSON-safe values.
+            x = x.replace({np.nan: None}) if "np" in globals() else x
+            return x.to_dict("records")
+    except Exception:
+        pass
+    return []
+
+
+def _v3_batter_records_to_df(records):
+    try:
+        if isinstance(records, list) and records:
+            return pd.DataFrame(records)
+    except Exception:
+        pass
+    return pd.DataFrame()
+
+
+def _v3_batter_load_snapshot():
+    try:
+        data = load_json(V3_BATTER_SNAPSHOT_FILE, {})
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _v3_batter_save_snapshot():
+    """Save the full V3 batter workflow in one click.
+
+    Boards saved:
+    - Batter Upside
+    - Batter FS
+    - H+R+RBI
+    - Home Runs
+    - Official Plays
+    This is independent of pitcher snapshots and is meant for reloading later.
+    """
+    snap = {
+        "saved_at": now_iso() if "now_iso" in globals() else "",
+        "version": V3_BATTER_SAVE_PATCH_VERSION,
+        "boards": {},
+        "counts": {},
+    }
+
+    # Batter Upside.
+    try:
+        upside = build_v3_batter_upside_board_final()
+    except Exception as e:
+        upside = pd.DataFrame()
+        snap["upside_error"] = str(e)
+    snap["boards"]["batter_upside"] = _v3_batter_df_to_records(upside)
+    snap["counts"]["batter_upside"] = len(snap["boards"]["batter_upside"])
+
+    # Batter FS.
+    try:
+        fs, fs_meta = build_v3_batter_research_table("FS")
+    except Exception as e:
+        fs, fs_meta = pd.DataFrame(), {"status": str(e)}
+    snap["boards"]["batter_fs"] = _v3_batter_df_to_records(fs)
+    snap["batter_fs_meta"] = fs_meta if isinstance(fs_meta, dict) else {}
+    snap["counts"]["batter_fs"] = len(snap["boards"]["batter_fs"])
+
+    # H+R+RBI.
+    try:
+        hrr, hrr_meta = build_v3_batter_research_table("HRR")
+    except Exception as e:
+        hrr, hrr_meta = pd.DataFrame(), {"status": str(e)}
+    snap["boards"]["hrr"] = _v3_batter_df_to_records(hrr)
+    snap["hrr_meta"] = hrr_meta if isinstance(hrr_meta, dict) else {}
+    snap["counts"]["hrr"] = len(snap["boards"]["hrr"])
+
+    # Home Runs.
+    try:
+        hr, hr_meta = build_v3_home_run_table()
+    except Exception as e:
+        hr, hr_meta = pd.DataFrame(), {"status": str(e)}
+    snap["boards"]["home_runs"] = _v3_batter_df_to_records(hr)
+    snap["home_runs_meta"] = hr_meta if isinstance(hr_meta, dict) else {}
+    snap["counts"]["home_runs"] = len(snap["boards"]["home_runs"])
+
+    # Official Plays.
+    try:
+        official_parts = []
+        if isinstance(fs, pd.DataFrame) and not fs.empty:
+            official_parts.append(fs)
+        if isinstance(hrr, pd.DataFrame) and not hrr.empty:
+            official_parts.append(hrr)
+        if isinstance(hr, pd.DataFrame) and not hr.empty:
+            official_parts.append(hr)
+        official = pd.concat(official_parts, ignore_index=True) if official_parts else pd.DataFrame()
+        try:
+            official = _v3_filter_official_display_df(official)
+        except Exception:
+            pass
+    except Exception as e:
+        official = pd.DataFrame()
+        snap["official_error"] = str(e)
+    snap["boards"]["official_plays"] = _v3_batter_df_to_records(official)
+    snap["counts"]["official_plays"] = len(snap["boards"]["official_plays"])
+
+    try:
+        save_json(V3_BATTER_SNAPSHOT_FILE, snap)
+        hist = load_json(V3_BATTER_SNAPSHOT_HISTORY_FILE, [])
+        if not isinstance(hist, list):
+            hist = []
+        hist.append({k: v for k, v in snap.items() if k != "boards"})
+        save_json(V3_BATTER_SNAPSHOT_HISTORY_FILE, hist[-250:])
+    except Exception as e:
+        return 0, {"error": str(e), "counts": snap.get("counts", {})}
+
+    total = int(sum([int(v or 0) for v in snap.get("counts", {}).values()]))
+    return total, snap
+
+
+# Wrap builders so a saved snapshot can be loaded when the live board is empty.
+try:
+    _v3_live_build_upside_before_save_patch = build_v3_batter_upside_board_final
+    def build_v3_batter_upside_board_final():
+        try:
+            df = _v3_live_build_upside_before_save_patch()
+            if isinstance(df, pd.DataFrame) and not df.empty:
+                return df
+        except Exception:
+            df = pd.DataFrame()
+        snap = _v3_batter_load_snapshot()
+        return _v3_batter_records_to_df((snap.get("boards") or {}).get("batter_upside"))
+except Exception:
+    pass
+
+try:
+    _v3_live_build_research_before_save_patch = build_v3_batter_research_table
+    def build_v3_batter_research_table(market="FS"):
+        m = str(market or "FS").upper()
+        try:
+            df, meta = _v3_live_build_research_before_save_patch(market)
+            if isinstance(df, pd.DataFrame) and not df.empty:
+                return df, meta
+        except Exception as e:
+            df, meta = pd.DataFrame(), {"status": str(e)}
+        snap = _v3_batter_load_snapshot()
+        key = "batter_fs" if m == "FS" else "hrr"
+        saved_df = _v3_batter_records_to_df((snap.get("boards") or {}).get(key))
+        saved_meta = snap.get("batter_fs_meta" if m == "FS" else "hrr_meta", {})
+        if isinstance(saved_df, pd.DataFrame) and not saved_df.empty:
+            return saved_df, {**(saved_meta if isinstance(saved_meta, dict) else {}), "status": "Loaded saved batter snapshot"}
+        return df, meta
+except Exception:
+    pass
+
+try:
+    _v3_live_build_hr_before_save_patch = build_v3_home_run_table
+    def build_v3_home_run_table():
+        try:
+            df, meta = _v3_live_build_hr_before_save_patch()
+            if isinstance(df, pd.DataFrame) and not df.empty:
+                return df, meta
+        except Exception as e:
+            df, meta = pd.DataFrame(), {"status": str(e)}
+        snap = _v3_batter_load_snapshot()
+        saved_df = _v3_batter_records_to_df((snap.get("boards") or {}).get("home_runs"))
+        saved_meta = snap.get("home_runs_meta", {})
+        if isinstance(saved_df, pd.DataFrame) and not saved_df.empty:
+            return saved_df, {**(saved_meta if isinstance(saved_meta, dict) else {}), "status": "Loaded saved batter snapshot"}
+        return df, meta
+except Exception:
+    pass
+
+
+def _v3_pct_from_any(v):
+    try:
+        if v is None:
+            return None
+        s = str(v)
+        m = re.search(r"(\d+(?:\.\d+)?)\s*%", s)
+        if m:
+            return float(m.group(1))
+        # Handles "8/10" style.
+        m = re.search(r"(\d+)\s*/\s*(\d+)", s)
+        if m and float(m.group(2)) > 0:
+            return float(m.group(1)) / float(m.group(2)) * 100.0
+        x = float(str(v).replace("%", ""))
+        if 0 <= x <= 1:
+            x *= 100.0
+        return x
+    except Exception:
+        return None
+
+
+def _v3_best_hit_rate_from_row(row):
+    vals = []
+    for k in ["Best Hit Rate %", "Hit Rate %", "Same-Line", "Last 10", "Last 15", "Last 5", "Recent Hit Rate", "HR Hit Rate %"]:
+        if isinstance(row, dict) and k in row:
+            pct = _v3_pct_from_any(row.get(k))
+            if pct is not None:
+                vals.append(pct)
+    return max(vals) if vals else None
+
+
+def _v3_edge_ok_for_market(row):
+    edge = abs(_v3_final_num(row.get("Edge"), 0) or 0)
+    market = str(row.get("Market") or "").upper()
+    if "FS" in market or "FANTASY" in market:
+        return edge >= 1.0
+    if "HOME RUN" in market:
+        return True
+    return edge >= 0.30
+
+
+def _v3_batter_tag_for_row(row):
+    hit = _v3_best_hit_rate_from_row(row)
+    if hit is not None and hit >= 80 and _v3_edge_ok_for_market(row):
+        return "🔥"
+    if hit is not None and hit >= 70:
+        return "⚠️"
+    return ""
+
+
+# Tighten official display: 80%+ becomes fire; 70-79% stays warning/strong-watch; below 70 drops out.
+try:
+    _v3_filter_official_display_before_80_patch = _v3_filter_official_display_df
+    def _v3_filter_official_display_df(df):
+        d = _v3_filter_official_display_before_80_patch(df)
+        if not isinstance(d, pd.DataFrame) or d.empty:
+            return d
+        x = d.copy()
+        x["Best Hit Rate %"] = x.apply(lambda r: _v3_best_hit_rate_from_row(r.to_dict()), axis=1)
+        x = x[pd.to_numeric(x["Best Hit Rate %"], errors="coerce").fillna(0) >= 70].copy()
+        if x.empty:
+            return x
+        x["Tag"] = x.apply(lambda r: _v3_batter_tag_for_row(r.to_dict()), axis=1)
+        x["V3 Batter Gate"] = x["Best Hit Rate %"].apply(lambda p: "🔥 80%+ HIT RATE" if float(p or 0) >= 80 else "⚠️ 70%+ WATCH")
+        return x.sort_values(["Best Hit Rate %", "Sync Score" if "Sync Score" in x.columns else "Best Hit Rate %"], ascending=False, na_position="last")
+except Exception:
+    pass
+
+
+# Override top batter board render to show clean 80%+ and 70%+ buckets.
+try:
+    _v3_render_top_batter_before_80_patch = render_v3_top_batter_plays_board
+    def render_v3_top_batter_plays_board():
+        st.markdown('<div class="section-title-pro">🔥 Batter Upside Board — 80%+ Hit Rate Focus</div>', unsafe_allow_html=True)
+        st.caption("Batter-only board. 🔥 = 80%+ hit-rate profile with enough edge. ⚠️ = 70–79% watch list. Full board stays available below.")
+        df = build_v3_batter_upside_board_final()
+        if not isinstance(df, pd.DataFrame) or df.empty:
+            st.info("No active Underdog batter lines matched yet. Refresh after the board posts or save/load a batter snapshot.")
+            return
+        d = df.copy()
+        d["Best Hit Rate %"] = d.apply(lambda r: _v3_best_hit_rate_from_row(r.to_dict()), axis=1)
+        d["Tag"] = d.apply(lambda r: _v3_batter_tag_for_row(r.to_dict()), axis=1)
+        hit = pd.to_numeric(d["Best Hit Rate %"], errors="coerce")
+        elite = d[(hit >= 80) & (d["Tag"] == "🔥")].copy()
+        strong = d[(hit >= 70) & (hit < 80)].copy()
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("UD Players", len(d))
+        c2.metric("🔥 80%+", len(elite))
+        c3.metric("⚠️ 70%+", len(strong))
+        c4.metric("Mode", "Batter Only")
+        show_cols = [c for c in ["Tag", "Player", "Team", "Opponent", "Projected PA", "FS Projection", "FS Line", "FS Pick", "FS Edge", "HRR Projection", "HRR Line", "HRR Pick", "HRR Edge", "HR Probability", "HR Line", "HR Pick", "Best Hit Rate %", "Upside Score"] if c in d.columns]
+        st.markdown("#### 🔥 Best Batter Plays — 80%+ Hit Rate")
+        if elite.empty:
+            st.info("No 80%+ batter plays right now. That is okay — batting props should be selective.")
+        else:
+            st.dataframe(elite[show_cols].head(40), use_container_width=True, hide_index=True)
+        st.markdown("#### ⚠️ Strong Watch List — 70–79% Hit Rate")
+        if strong.empty:
+            st.info("No 70–79% watch plays right now.")
+        else:
+            st.dataframe(strong[show_cols].head(60), use_container_width=True, hide_index=True)
+        with st.expander("📋 Full Batter Projection Board", expanded=False):
+            st.dataframe(d[show_cols].head(150), use_container_width=True, hide_index=True)
+except Exception:
+    pass
+
+
+# Fulfill queued top-button save after all V3 batter builders are defined.
+if st.session_state.get("v3_batter_save_requested"):
+    total, snap = _v3_batter_save_snapshot()
+    st.session_state["v3_batter_save_requested"] = False
+    st.session_state["last_saved_count"] = total
+    if isinstance(snap, dict) and snap.get("error"):
+        st.error(f"Batter snapshot save failed: {snap.get('error')}")
+    else:
+        st.success(
+            "Saved V3 batter snapshot: "
+            f"Upside {snap.get('counts',{}).get('batter_upside',0)}, "
+            f"Batter FS {snap.get('counts',{}).get('batter_fs',0)}, "
+            f"H+R+RBI {snap.get('counts',{}).get('hrr',0)}, "
+            f"Home Runs {snap.get('counts',{}).get('home_runs',0)}, "
+            f"Official {snap.get('counts',{}).get('official_plays',0)}."
+        )
+
+
+
+# ============================================================
+# ONE WAY PICKZ — V3 BATTER QUALITY UPGRADE PATCH
+# ============================================================
+# Adds the four batter-side improvements requested:
+# 1) L5/L10/L20 agreement score
+# 2) RHP/LHP matchup split label/boost when columns are available
+# 3) V3 batter confidence score
+# 4) Elite/Strong/Full slate split
+# Display/save layer only: projection math, lines, player cards, and builders stay intact.
+
+V3_BATTER_QUALITY_PATCH_VERSION = "V3_BATTER_CONFIDENCE_SPLITS_L5L10L20_2026_06_20"
+
+
+def _v3_bq_num(v, default=None):
+    try:
+        if v is None:
+            return default
+        s = str(v).strip()
+        if s in ["", "—", "None", "nan", "NaN"]:
+            return default
+        m = re.search(r"(-?\d+(?:\.\d+)?)\s*%", s)
+        if m:
+            return float(m.group(1))
+        m = re.search(r"(\d+)\s*/\s*(\d+)", s)
+        if m and float(m.group(2)) > 0:
+            return float(m.group(1)) / float(m.group(2)) * 100.0
+        x = float(s.replace("%", "").replace(",", ""))
+        if 0 <= x <= 1:
+            x *= 100.0
+        return x
+    except Exception:
+        return default
+
+
+def _v3_bq_first_num(row, keys, default=None):
+    if not isinstance(row, dict):
+        return default
+    for k in keys:
+        if k in row:
+            x = _v3_bq_num(row.get(k), None)
+            if x is not None:
+                return x
+    # soft contains fallback
+    wanted = [str(k).lower() for k in keys]
+    for k, v in row.items():
+        lk = str(k).lower()
+        if any(w in lk for w in wanted):
+            x = _v3_bq_num(v, None)
+            if x is not None:
+                return x
+    return default
+
+
+def _v3_bq_best_hit(row):
+    try:
+        x = _v3_best_hit_rate_from_row(row)
+        if x is not None:
+            return float(x)
+    except Exception:
+        pass
+    return _v3_bq_first_num(row, ["Best Hit Rate %", "Hit Rate %", "Same-Line", "Recent Hit Rate", "HR Hit Rate %"], 0) or 0
+
+
+def _v3_bq_l_rates(row):
+    l5 = _v3_bq_first_num(row, ["L5 Hit Rate %", "Last 5 Hit Rate %", "Last 5", "L5", "Recent5 Hit Rate %", "Recent 5 Hit Rate %"])
+    l10 = _v3_bq_first_num(row, ["L10 Hit Rate %", "Last 10 Hit Rate %", "Last 10", "L10", "Recent10 Hit Rate %", "Recent 10 Hit Rate %"])
+    l20 = _v3_bq_first_num(row, ["L20 Hit Rate %", "Last 20 Hit Rate %", "Last 20", "L20", "Recent20 Hit Rate %", "Recent 20 Hit Rate %"])
+    season = _v3_bq_first_num(row, ["Season Hit Rate %", "Hit Rate %", "Best Hit Rate %", "Same-Line"])
+    return l5, l10, l20, season
+
+
+def _v3_bq_agreement(row):
+    l5, l10, l20, season = _v3_bq_l_rates(row)
+    vals = [x for x in [l5, l10, l20, season] if x is not None and x >= 0]
+    if not vals:
+        hit = _v3_bq_best_hit(row)
+        return max(45.0, min(80.0, hit)), "NEUTRAL_SAMPLE", "L5/L10/L20 not found"
+    avg = sum(vals) / len(vals)
+    spread = max(vals) - min(vals) if len(vals) > 1 else 0.0
+    score = avg - min(18.0, spread * 0.35)
+    # extra reward if the key windows line up.
+    if all([(x is not None and x >= 70) for x in [l5, l10] if x is not None]):
+        score += 4
+    if all([(x is not None and x >= 80) for x in [l5, l10, l20] if x is not None]):
+        score += 5
+    score = max(0.0, min(100.0, score))
+    label = "ELITE_RECENT_AGREEMENT" if score >= 85 else "STRONG_RECENT_AGREEMENT" if score >= 75 else "MIXED_RECENT_FORM" if score >= 60 else "WEAK_RECENT_FORM"
+    note = f"L5 {l5 if l5 is not None else '—'} | L10 {l10 if l10 is not None else '—'} | L20 {l20 if l20 is not None else '—'} | Season {season if season is not None else '—'}"
+    return round(score, 1), label, note
+
+
+def _v3_bq_hand_label(row):
+    # Uses real split columns when available; otherwise stays neutral.
+    pitcher_hand = str(row.get("Pitcher Hand") or row.get("Opp Pitcher Hand") or row.get("Opp Starter Hand") or row.get("Throws") or "").upper()
+    if "L" in pitcher_hand and "R" not in pitcher_hand:
+        target = "LHP"
+        split = _v3_bq_first_num(row, ["vs LHP Hit Rate %", "LHP Hit Rate %", "vsLHP Hit Rate %", "vs LHP", "Split vs LHP"])
+    elif "R" in pitcher_hand:
+        target = "RHP"
+        split = _v3_bq_first_num(row, ["vs RHP Hit Rate %", "RHP Hit Rate %", "vsRHP Hit Rate %", "vs RHP", "Split vs RHP"])
+    else:
+        target = "UNKNOWN"
+        split = None
+    if split is None:
+        return 0.0, "HAND_SPLIT_NEUTRAL", f"Pitcher hand {target}; split not found"
+    if split >= 80:
+        return 6.0, f"PLUS_vs_{target}", f"{split:.1f}% vs {target}"
+    if split >= 70:
+        return 3.0, f"OK_vs_{target}", f"{split:.1f}% vs {target}"
+    if split <= 55:
+        return -6.0, f"RISK_vs_{target}", f"{split:.1f}% vs {target}"
+    return 0.0, f"NEUTRAL_vs_{target}", f"{split:.1f}% vs {target}"
+
+
+def _v3_bq_lineup_boost(row):
+    slot = _v3_bq_first_num(row, ["Lineup Slot", "Batting Order", "Lineup Spot", "Projected Batting Order", "Batting Slot"])
+    pa = _v3_bq_first_num(row, ["Projected PA", "PA Projection", "Proj PA"])
+    boost = 0.0
+    label = "LINEUP_NEUTRAL"
+    if slot is not None:
+        if slot <= 3:
+            boost += 6; label = "TOP_ORDER_PLUS"
+        elif slot <= 5:
+            boost += 3; label = "MIDDLE_ORDER_OK"
+        elif slot >= 8:
+            boost -= 4; label = "BOTTOM_ORDER_RISK"
+    if pa is not None:
+        if pa >= 4.4:
+            boost += 4
+        elif pa < 3.7:
+            boost -= 3
+    return boost, label, f"Slot {slot if slot is not None else '—'} | PA {pa if pa is not None else '—'}"
+
+
+def _v3_bq_edge_score(row):
+    edges = []
+    for k in ["FS Edge", "HRR Edge", "Edge", "Line Edge", "Projection Edge"]:
+        x = _v3_bq_num(row.get(k), None) if isinstance(row, dict) else None
+        if x is not None:
+            edges.append(abs(x))
+    if not edges:
+        return 0.0, "NO_EDGE_FOUND"
+    e = max(edges)
+    # Batter FS edges are larger scale, HRR smaller; this generic scale keeps display only.
+    score = min(22.0, e * 14.0)
+    label = "STRONG_EDGE" if score >= 14 else "THIN_EDGE" if score < 7 else "OK_EDGE"
+    return score, label
+
+
+def _v3_bq_confidence_from_row(row):
+    hit = _v3_bq_best_hit(row)
+    agree, agree_label, agree_note = _v3_bq_agreement(row)
+    hand_boost, hand_label, hand_note = _v3_bq_hand_label(row)
+    lineup_boost, lineup_label, lineup_note = _v3_bq_lineup_boost(row)
+    edge_score, edge_label = _v3_bq_edge_score(row)
+    base = 35.0
+    conf = base + (hit * 0.28) + (agree * 0.22) + edge_score + hand_boost + lineup_boost
+    conf = max(0.0, min(99.0, conf))
+    if conf >= 90 and hit >= 80 and edge_label == "STRONG_EDGE":
+        tier = "🔥 ELITE BATTER PLAY"
+    elif conf >= 82 and hit >= 70:
+        tier = "⚠️ STRONG BATTER WATCH"
+    elif conf >= 72:
+        tier = "THIN / TRACK ONLY"
+    else:
+        tier = "PASS / LOW EDGE"
+    return {
+        "V3 Batter Confidence": round(conf, 1),
+        "V3 Batter Tier": tier,
+        "L5/L10/L20 Agreement": agree,
+        "Recent Agreement Label": agree_label,
+        "Recent Agreement Note": agree_note,
+        "Hand Split Label": hand_label,
+        "Hand Split Note": hand_note,
+        "Lineup Context": lineup_label,
+        "Lineup Note": lineup_note,
+        "Batter Edge Label": edge_label,
+        "V3 Batter Quality Version": V3_BATTER_QUALITY_PATCH_VERSION,
+    }
+
+
+def _v3_bq_enhance_df(df):
+    if not isinstance(df, pd.DataFrame) or df.empty:
+        return df
+    d = df.copy()
+    try:
+        vals = d.apply(lambda r: _v3_bq_confidence_from_row(r.to_dict()), axis=1)
+        add = pd.DataFrame(list(vals))
+        for c in add.columns:
+            d[c] = add[c].values
+        if "Best Hit Rate %" not in d.columns:
+            d["Best Hit Rate %"] = d.apply(lambda r: _v3_bq_best_hit(r.to_dict()), axis=1)
+        # Clean tag from the stricter confidence tier.
+        d["Batter Slate Tag"] = d["V3 Batter Tier"].astype(str).apply(lambda s: "🔥" if "ELITE" in s else "⚠️" if "STRONG" in s else "")
+    except Exception:
+        return df
+    return d
+
+
+# Enhance the saved/source board itself so every tab/save sees the same confidence fields.
+try:
+    _v3_build_upside_before_quality_patch = build_v3_batter_upside_board_final
+    def build_v3_batter_upside_board_final():
+        return _v3_bq_enhance_df(_v3_build_upside_before_quality_patch())
+except Exception:
+    pass
+
+try:
+    _v3_build_research_before_quality_patch = build_v3_batter_research_table
+    def build_v3_batter_research_table(market="FS"):
+        df, meta = _v3_build_research_before_quality_patch(market)
+        return _v3_bq_enhance_df(df), meta
+except Exception:
+    pass
+
+try:
+    _v3_build_hr_before_quality_patch = build_v3_home_run_table
+    def build_v3_home_run_table():
+        df, meta = _v3_build_hr_before_quality_patch()
+        return _v3_bq_enhance_df(df), meta
+except Exception:
+    pass
+
+
+# Final top board render: Elite / Strong / Full, with confidence + L5/L10/L20 + handedness notes.
+def render_v3_top_batter_plays_board():
+    st.markdown('<div class="section-title-pro">🔥 Batter Upside Board — Confidence + Splits</div>', unsafe_allow_html=True)
+    st.caption("🔥 Elite = 80%+ hit-rate profile + strong edge + confidence. ⚠️ Strong = 70%+ hit-rate/watch profile. Full board remains available for tracking.")
+    df = build_v3_batter_upside_board_final()
+    if not isinstance(df, pd.DataFrame) or df.empty:
+        st.info("No active Underdog batter lines matched yet. Refresh after the board posts or load a saved batter snapshot.")
+        return
+    d = _v3_bq_enhance_df(df)
+    conf = pd.to_numeric(d.get("V3 Batter Confidence"), errors="coerce").fillna(0)
+    hit = pd.to_numeric(d.get("Best Hit Rate %"), errors="coerce").fillna(0)
+    tier = d.get("V3 Batter Tier", pd.Series([""] * len(d))).astype(str)
+    elite = d[(conf >= 90) & (hit >= 80) & tier.str.contains("ELITE", na=False)].copy()
+    strong = d[(conf >= 82) & (hit >= 70) & (~d.index.isin(elite.index))].copy()
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("UD Players", len(d))
+    c2.metric("🔥 Elite", len(elite))
+    c3.metric("⚠️ Strong", len(strong))
+    c4.metric("Top Confidence", f"{conf.max():.1f}" if len(conf) else "—")
+
+    show_cols = [c for c in [
+        "Batter Slate Tag", "Player", "Team", "Opponent", "Projected PA",
+        "FS Projection", "FS Line", "FS Pick", "FS Edge",
+        "HRR Projection", "HRR Line", "HRR Pick", "HRR Edge",
+        "HR Probability", "HR Line", "HR Pick",
+        "Best Hit Rate %", "L5/L10/L20 Agreement", "V3 Batter Confidence", "V3 Batter Tier",
+        "Hand Split Label", "Lineup Context", "Batter Edge Label", "Upside Score"
+    ] if c in d.columns]
+
+    st.markdown("#### 🔥 Elite Batter Plays")
+    if elite.empty:
+        st.info("No elite 80%+ confidence plays right now. That is normal for batter props — do not force volume.")
+    else:
+        st.dataframe(elite.sort_values(["V3 Batter Confidence", "Best Hit Rate %"], ascending=False)[show_cols].head(40), use_container_width=True, hide_index=True)
+
+    st.markdown("#### ⚠️ Strong Batter Watch List")
+    if strong.empty:
+        st.info("No strong 70%+ watch plays right now.")
+    else:
+        st.dataframe(strong.sort_values(["V3 Batter Confidence", "Best Hit Rate %"], ascending=False)[show_cols].head(60), use_container_width=True, hide_index=True)
+
+    with st.expander("📋 Full Batter Projection Board", expanded=False):
+        st.dataframe(d.sort_values(["V3 Batter Confidence", "Best Hit Rate %"], ascending=False, na_position="last")[show_cols].head(200), use_container_width=True, hide_index=True)
+
+    names = d["Player"].dropna().astype(str).tolist() if "Player" in d.columns else []
+    if names:
+        selected = st.selectbox("Open batter quality card", names, key=_v3_unique_widget_key("batter_quality_card_select"))
+        rr = d[d["Player"].astype(str) == selected].iloc[0].to_dict()
+        with st.expander(f"{selected} — Batter Quality Card", expanded=False):
+            a,b,c,dcol = st.columns(4)
+            a.metric("Confidence", rr.get("V3 Batter Confidence", "—"))
+            b.metric("Best Hit Rate", rr.get("Best Hit Rate %", "—"))
+            c.metric("Agreement", rr.get("L5/L10/L20 Agreement", "—"))
+            dcol.metric("Tier", str(rr.get("V3 Batter Tier", "—")).replace("🔥 ", "").replace("⚠️ ", ""))
+            st.write({
+                "Recent form": rr.get("Recent Agreement Note", "—"),
+                "Hand split": rr.get("Hand Split Note", "—"),
+                "Lineup": rr.get("Lineup Note", "—"),
+                "Edge label": rr.get("Batter Edge Label", "—"),
+                "Version": rr.get("V3 Batter Quality Version", V3_BATTER_QUALITY_PATCH_VERSION),
+            })
 
 
 # Clean V3 batter-only tab layout. Removed visible Pitcher K, Pitcher FS, Research Hub, and Moneyline tabs.
