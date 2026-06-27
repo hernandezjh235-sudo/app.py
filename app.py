@@ -26988,41 +26988,60 @@ def _okr_mi_blended_k_pct(rec, hand):
     """Verified MLB team K% blend for small projection nudge.
 
     Returns percent units (e.g. 24.7), not decimal.
-    Blend: 70% season split vs pitcher hand, 20% last-30 split vs pitcher hand,
-    10% overall season. If a piece is missing, weights renormalize.
+
+    CAREFUL WEIGHTING:
+    - 35% Team K% Overall
+    - 45% Team K% vs pitcher hand (vs RHP/LHP)
+    - 20% Team K% last 30 days vs pitcher hand
+
+    Missing pieces are safely re-normalized. This keeps the matchup environment
+    useful without letting one missing split break or over-swing the projection.
     """
     try:
         hand = str(hand or '').upper()
         split = 'vs LHP' if hand == 'LHP' else 'vs RHP' if hand == 'RHP' else None
+
         pieces = []
+        # Overall season K% = stability anchor.
+        pieces.append((_okr_num((rec or {}).get('K% Overall'), None), 0.35, '35% overall'))
+
+        # Hand-specific split = most important matchup piece.
         if split:
-            pieces.append((_okr_num((rec or {}).get(f'K% {split}'), None), 0.70, f'season {split}'))
-            pieces.append((_okr_num((rec or {}).get(f'K% L30 {split}'), None), 0.20, f'L30 {split}'))
-        pieces.append((_okr_num((rec or {}).get('K% Overall'), None), 0.10, 'season overall'))
-        vals = [(v,w,n) for v,w,n in pieces if v is not None]
+            pieces.append((_okr_num((rec or {}).get(f'K% {split}'), None), 0.45, f'45% season {split}'))
+            pieces.append((_okr_num((rec or {}).get(f'K% L30 {split}'), None), 0.20, f'20% L30 {split}'))
+
+        vals = [(v, w, n) for v, w, n in pieces if v is not None]
         if not vals:
             return None, 'NO_VERIFIED_K_BLEND'
-        total_w = sum(w for _,w,_ in vals) or 1.0
-        blend = sum(v*w for v,w,_ in vals) / total_w
-        note = ' + '.join([f'{int(round((w/total_w)*100))}% {n}' for _,w,n in vals])
+
+        total_w = sum(w for _, w, _ in vals) or 1.0
+        blend = sum(v * w for v, w, _ in vals) / total_w
+        note = ' + '.join([f'{int(round((w/total_w)*100))}% {n.split(" ", 1)[-1]}' for _, w, n in vals])
         return round(float(blend), 2), note
     except Exception:
         return None, 'K_BLEND_ERROR'
 
 
 def _okr_mi_projection_nudge(row, rec, hand):
-    """Small mathematically grounded matchup nudge from official MLB team K%.
+    """Small capped K-environment projection nudge from official MLB team K%.
 
-    The nudge is BF * (verified_team_K% - existing_model_opp_K%) * weight,
-    capped at +/-0.35 K so it cannot overpower the core model.
+    The verified K environment is blended as:
+      35% overall + 45% vs pitcher hand + 20% last-30 vs pitcher hand.
+
+    It then compares verified team K% to the model's existing opponent K%.
+    The adjustment is intentionally small and capped at +/-0.30 K so it can
+    help matchup context without overpowering pitcher skill, BF/IP, leash,
+    learning, or line-aware projection layers.
     """
     try:
         verified_k, blend_note = _okr_mi_blended_k_pct(rec, hand)
         if verified_k is None:
             return 0.0, 'MI_NO_VERIFIED_TEAM_K', '', verified_k
+
         current_k = _okr_num(row.get('Opp K%'), None)
         if current_k is None:
             current_k = _okr_num(row.get('Opponent K% vs Pitcher Hand'), None)
+
         if current_k is None:
             current_k = 22.2
             current_note = 'league_avg_fallback'
@@ -27030,50 +27049,62 @@ def _okr_mi_projection_nudge(row, rec, hand):
             if abs(current_k) <= 1:
                 current_k *= 100.0
             current_note = 'existing_opp_k'
+
         bf = _okr_num(row.get('Exp BF'), None)
         if bf is None:
             bf = _okr_num(row.get('BF-K Expected BF 2.1'), None)
+
         if bf is None:
             bf = 22.0
             bf_note = 'bf_fallback_22'
         else:
             bf_note = 'exp_bf'
+
         raw = float(bf) * ((float(verified_k) - float(current_k)) / 100.0)
-        # Small weight protects the 18-11 core engine: 45% of raw K opportunity delta.
-        weighted = raw * 0.45
-        capped = max(-0.35, min(0.35, weighted))
-        if capped >= 0.25:
+
+        # Conservative engine-protection layer:
+        # use 35% of raw K-opportunity delta and cap at +/-0.30 Ks.
+        weighted = raw * 0.35
+        capped = max(-0.30, min(0.30, weighted))
+
+        if capped >= 0.22:
             label = 'MI_ELITE_K_ENV_PLUS'
-        elif capped >= 0.08:
+        elif capped >= 0.07:
             label = 'MI_K_ENV_PLUS'
-        elif capped <= -0.25:
+        elif capped <= -0.22:
             label = 'MI_ELITE_CONTACT_TAX'
-        elif capped <= -0.08:
+        elif capped <= -0.07:
             label = 'MI_CONTACT_TAX'
         else:
             label = 'MI_NEUTRAL'
-        reason = f'official MLB team K blend {verified_k:.2f}% ({blend_note}) vs {current_note} {current_k:.2f}%; {bf_note} {bf:.1f}; raw {raw:+.2f}K * 0.45 capped +/-0.35 = {capped:+.2f}K'
+
+        reason = (
+            f'official MLB team K blend {verified_k:.2f}% ({blend_note}) '
+            f'vs {current_note} {current_k:.2f}%; {bf_note} {bf:.1f}; '
+            f'raw {raw:+.2f}K * 0.35 capped +/-0.30 = {capped:+.2f}K'
+        )
         return round(float(capped), 2), label, reason, verified_k
     except Exception as e:
         return 0.0, 'MI_ERROR', str(e), None
 
 
 def _okr_mi_decision_from_proj(proj, line, old_decision):
-    """Keep filters conservative; only refresh non-pass directional decisions."""
+    """Simple card decision from the final displayed projection.
+
+    Keeps NO LINE unchanged. Otherwise returns one clean label:
+    OVER / OVER LEAN / UNDER / UNDER LEAN / PASS.
+    """
     try:
         old = str(old_decision or '')
         if 'NO LINE' in old.upper() or 'NO_UD_LINE' in old.upper():
             return old_decision
-        p = _okr_num(proj, None); l = _okr_num(line, None)
+
+        p = _okr_num(proj, None)
+        l = _okr_num(line, None)
         if p is None or l is None:
             return old_decision
+
         edge = p - l
-        if 'PASS' in old.upper():
-            if edge >= 1.00:
-                return '🚫 PASS — OVER LEAN CONFIRMED BY TEAM K'
-            if edge <= -1.00:
-                return '🚫 PASS — UNDER LEAN CONFIRMED BY TEAM K'
-            return old_decision
         if edge >= 1.00:
             return '🔥 OVER'
         if edge > 0.15:
@@ -27082,7 +27113,7 @@ def _okr_mi_decision_from_proj(proj, line, old_decision):
             return '🔥 UNDER'
         if edge < -0.15:
             return '⚠️ UNDER LEAN'
-        return '🚫 PASS — TRUE EDGE THIN'
+        return '🚫 PASS'
     except Exception:
         return old_decision
 
@@ -27213,7 +27244,7 @@ def _okr_apply_team_k_ranks_to_df(df, board=None):
         d["Team K Read"] = ""
 
     # Matchup Intelligence Projection Nudge 1.0 — small weight only.
-    # Uses verified MLB team K% vs handedness and L30 split; caps at +/-0.35 K.
+    # Uses 35% overall + 45% hand split + 20% L30 hand split; caps at +/-0.30 K.
     try:
         mi_pre, mi_adj, mi_final, mi_label, mi_reason, mi_verified = [], [], [], [], [], []
         for idx, row in d.iterrows():
@@ -27234,7 +27265,7 @@ def _okr_apply_team_k_ranks_to_df(df, board=None):
         d["Matchup Intel Reason"] = mi_reason
         d["Matchup Intel Verified Team K%"] = mi_verified
         d["Matchup Intelligence Final K Projection"] = mi_final
-        d["Matchup Intelligence Version"] = "MATCHUP_INTEL_SMALL_WEIGHT_0_45_CAP_0_35_2026_06_25"
+        d["Matchup Intelligence Version"] = "MATCHUP_INTEL_WEIGHTED_35_45_20_CAP_0_30_2026_06_27"
         # Promote this as the final display/export projection, but record the pre-value above.
         for c in ["K PROJ", "Line-Aware Smart Final K Projection", "Final K Projection"]:
             if c in d.columns:
