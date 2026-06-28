@@ -10401,7 +10401,11 @@ def official_card_k_row(p):
         df = build_kproj_table([p])
         _OFFICIAL_CARD_ROW_GUARD = False
         if df is not None and not df.empty:
-            return df.iloc[0].to_dict()
+            row = df.iloc[0].to_dict()
+            # Display-only: card row is one-player, so overlay the slate-wide rank map.
+            if '_owp_overlay_full_board_pitcher_k_rank' in globals():
+                row = _owp_overlay_full_board_pitcher_k_rank(row)
+            return row
     except Exception:
         try:
             _OFFICIAL_CARD_ROW_GUARD = False
@@ -12971,6 +12975,9 @@ def render_kproj_tab(board):
     # slates, downloads, and pitcher-card filtering. This prevents Sale/Will-style
     # duplicate lines from showing different projections in different sections.
     df = _owp_one_final_row_per_pitcher(df)
+    # Display-only rank fix: compute Pitcher K% rank from the final visible board, not per-card one-row tables.
+    if '_owp_apply_pitcher_k_board_ranks_display_only' in globals():
+        df = _owp_apply_pitcher_k_board_ranks_display_only(df)
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("K Proj Rows", len(df))
     c2.metric("Over Leans", int(df["Decision"].astype(str).str.contains("OVER", regex=False).sum()) if not df.empty else 0)
@@ -26983,6 +26990,102 @@ def _okr_pitcher_strength_label(rank, k_pct):
 
 
 
+
+
+
+# DISPLAY-ONLY FIX: compute Pitcher K% board ranks from the FULL visible slate, not from a one-card row.
+# This does NOT change projections, decisions, simulations, learning, or grading.
+def _owp_apply_pitcher_k_board_ranks_display_only(df):
+    """Assign slate-wide Pitcher K% board ranks after the full projection board is built.
+
+    Previously, pitcher cards could build a one-player table for display syncing; if rank was
+    calculated on that one-row table, every card could show Board Rank #1. This function ranks
+    the full displayed dataframe only, stores the rank map in session_state, and leaves all model
+    projection columns untouched.
+    """
+    try:
+        if not isinstance(df, pd.DataFrame) or df.empty:
+            return df
+        d = df.copy()
+        if "Pitcher" not in d.columns:
+            return d
+        if "Pitcher K%" not in d.columns:
+            d["Pitcher K% Board Rank"] = "—"
+            d["Pitcher K% Strength Label"] = "PITCHER K% UNKNOWN"
+            d["Pitcher K% Rank Source"] = "Full visible projection board | unavailable"
+            return d
+
+        vals = []
+        for idx, row in d.iterrows():
+            try:
+                v = safe_float(row.get("Pitcher K%"), None)
+            except Exception:
+                v = None
+            if v is None:
+                continue
+            # App stores K% as decimal in most places; display/export uses percent.
+            if abs(float(v)) <= 1:
+                v = float(v) * 100.0
+            vals.append((idx, float(v)))
+
+        # Stable competition ranking: ties get same rank, next rank skips accordingly.
+        ranked = sorted(vals, key=lambda x: (-x[1], str(d.loc[x[0]].get("Pitcher", ""))))
+        rank_map = {}
+        last_val = None
+        last_rank = 0
+        for pos, (idx, v) in enumerate(ranked, start=1):
+            if last_val is None or abs(v - last_val) > 1e-9:
+                last_rank = pos
+                last_val = v
+            rank_map[idx] = last_rank
+
+        d["Pitcher K% Board Rank"] = [rank_map.get(idx, "—") for idx in d.index]
+        d["Pitcher K% Strength Label"] = [
+            _okr_pitcher_strength_label(rank_map.get(idx, None), safe_float(d.loc[idx].get("Pitcher K%"), None))
+            for idx in d.index
+        ]
+        d["Pitcher K% Rank Source"] = "Full visible projection board | rank #1 = highest Pitcher K%"
+
+        # Store lookup for the mobile player cards, which rebuild a one-row table for card sync.
+        card_map = {}
+        for idx, row in d.iterrows():
+            nm = str(row.get("Pitcher") or "").strip()
+            if not nm:
+                continue
+            key = nm.lower()
+            card_map[key] = {
+                "rank": rank_map.get(idx, "—"),
+                "label": row.get("Pitcher K% Strength Label", "—"),
+                "source": "Full visible projection board | rank #1 = highest Pitcher K%",
+            }
+        try:
+            st.session_state["_owp_pitcher_k_full_board_rank_map"] = card_map
+        except Exception:
+            pass
+        return d
+    except Exception:
+        return df
+
+
+def _owp_overlay_full_board_pitcher_k_rank(card_row):
+    """Overlay the full-board rank onto a one-player card row; display-only."""
+    try:
+        if not isinstance(card_row, dict):
+            return card_row
+        nm = str(card_row.get("Pitcher") or card_row.get("pitcher") or "").strip().lower()
+        if not nm:
+            return card_row
+        rank_map = st.session_state.get("_owp_pitcher_k_full_board_rank_map", {})
+        info = rank_map.get(nm)
+        if not info:
+            return card_row
+        out = dict(card_row)
+        out["Pitcher K% Board Rank"] = info.get("rank", "—")
+        out["Pitcher K% Strength Label"] = info.get("label", out.get("Pitcher K% Strength Label", "—"))
+        out["Pitcher K% Rank Source"] = info.get("source", "Full visible projection board | rank #1 = highest Pitcher K%")
+        return out
+    except Exception:
+        return card_row
 
 def _okr_mi_blended_k_pct(rec, hand):
     """Verified MLB team K% blend for small projection nudge.
